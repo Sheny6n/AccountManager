@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-iced = "0.13"
+iced = { version = "0.13", features = ["tokio"] }
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 argon2 = "0.5"
 rand = "0.8"

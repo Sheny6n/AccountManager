@@ -129,6 +129,14 @@ impl Db {
         Ok(self.conn.last_insert_rowid())
     }
 
+    pub fn rekey(&self, key: &[u8]) -> Result<(), String> {
+        let mut hex = key_to_hex(key);
+        let pragma = format!("PRAGMA rekey = \"x'{}'\";", hex);
+        let result = self.conn.execute_batch(&pragma);
+        hex.zeroize();
+        result.map_err(|e| e.to_string())
+    }
+
     pub fn rename_group(&self, id: i64, name: &str) -> Result<(), String> {
         self.conn
             .execute("UPDATE groups SET name = ?1 WHERE id = ?2", params![name, id])
