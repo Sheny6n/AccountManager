@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use rusqlite::{params, Connection};
@@ -52,7 +53,8 @@ impl Db {
                 CREATE TABLE IF NOT EXISTS accounts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-                    site TEXT NOT NULL
+                    site TEXT NOT NULL,
+                    pinned INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS account_fields (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,9 +64,18 @@ impl Db {
                     value TEXT NOT NULL DEFAULT ''
                 );
                 CREATE INDEX IF NOT EXISTS idx_account_fields_account
-                    ON account_fields(account_id);",
+                    ON account_fields(account_id);
+                CREATE TABLE IF NOT EXISTS prefs (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );",
             )
             .map_err(|e| e.to_string())?;
+
+        // Ensure `pinned` exists on accounts tables created before it was added.
+        let _ = self
+            .conn
+            .execute("ALTER TABLE accounts ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0", []);
 
         self.migrate_legacy_columns().map_err(|e| e.to_string())?;
         Ok(())
@@ -129,6 +140,29 @@ impl Db {
         Ok(self.conn.last_insert_rowid())
     }
 
+    pub fn load_prefs(&self) -> Result<HashMap<String, String>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, value FROM prefs")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn set_pref(&self, key: &str, value: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO prefs (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn rekey(&self, key: &[u8]) -> Result<(), String> {
         let mut hex = key_to_hex(key);
         let pragma = format!("PRAGMA rekey = \"x'{}'\";", hex);
@@ -157,14 +191,19 @@ impl Db {
     pub fn list_accounts(&self, group_id: i64) -> Result<Vec<Account>, String> {
         let mut acc_stmt = self
             .conn
-            .prepare("SELECT id, group_id, site FROM accounts WHERE group_id = ?1 ORDER BY site")
+            .prepare(
+                "SELECT id, group_id, site, pinned FROM accounts
+                 WHERE group_id = ?1 ORDER BY pinned DESC, site",
+            )
             .map_err(|e| e.to_string())?;
         let mut accounts: Vec<Account> = acc_stmt
             .query_map(params![group_id], |r| {
+                let pinned: i64 = r.get(3)?;
                 Ok(Account {
                     id: r.get(0)?,
                     group_id: r.get(1)?,
                     site: r.get(2)?,
+                    pinned: pinned != 0,
                     fields: Vec::new(),
                 })
             })
@@ -198,19 +237,20 @@ impl Db {
     }
 
     pub fn upsert_account(&self, a: &Account) -> Result<i64, String> {
+        let pinned = if a.pinned { 1i64 } else { 0 };
         let id = if a.id == 0 {
             self.conn
                 .execute(
-                    "INSERT INTO accounts (group_id, site) VALUES (?1, ?2)",
-                    params![a.group_id, a.site],
+                    "INSERT INTO accounts (group_id, site, pinned) VALUES (?1, ?2, ?3)",
+                    params![a.group_id, a.site, pinned],
                 )
                 .map_err(|e| e.to_string())?;
             self.conn.last_insert_rowid()
         } else {
             self.conn
                 .execute(
-                    "UPDATE accounts SET group_id = ?1, site = ?2 WHERE id = ?3",
-                    params![a.group_id, a.site, a.id],
+                    "UPDATE accounts SET group_id = ?1, site = ?2, pinned = ?3 WHERE id = ?4",
+                    params![a.group_id, a.site, pinned, a.id],
                 )
                 .map_err(|e| e.to_string())?;
             a.id
@@ -237,6 +277,16 @@ impl Db {
         }
 
         Ok(id)
+    }
+
+    pub fn set_pinned(&self, id: i64, pinned: bool) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE accounts SET pinned = ?1 WHERE id = ?2",
+                params![if pinned { 1i64 } else { 0 }, id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn delete_account(&self, id: i64) -> Result<(), String> {

@@ -15,5 +15,6 @@ pub struct Account {
     pub id: i64,
     pub group_id: i64,
     pub site: String,
+    pub pinned: bool,
     pub fields: Vec<Field>,
 }

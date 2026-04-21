@@ -3,6 +3,7 @@ mod crypto;
 mod db;
 mod model;
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -80,7 +81,29 @@ struct MainState {
     editor: Option<AccountEditor>,
     error: Option<String>,
     renaming_group: Option<(i64, String)>,
+    group_menu_open: Option<i64>,
     settings: Option<SettingsState>,
+    site_width: f32,
+    actions_width: f32,
+    field_widths: HashMap<String, f32>,
+}
+
+const DEFAULT_SITE_WIDTH: f32 = 200.0;
+const DEFAULT_FIELD_WIDTH: f32 = 180.0;
+const DEFAULT_ACTIONS_WIDTH: f32 = 180.0;
+const COLUMN_STEP: f32 = 20.0;
+const MIN_COLUMN_WIDTH: f32 = 80.0;
+const MAX_COLUMN_WIDTH: f32 = 800.0;
+
+const PREF_COL_SITE: &str = "col.site";
+const PREF_COL_ACTIONS: &str = "col.actions";
+const PREF_COL_FIELD_PREFIX: &str = "col.field.";
+
+#[derive(Debug, Clone)]
+enum ColumnId {
+    Site,
+    Actions,
+    Field(String),
 }
 
 #[derive(Default)]
@@ -125,11 +148,15 @@ enum Message {
     RenameGroupChanged(String),
     ConfirmRenameGroup,
     CancelRenameGroup,
+    ToggleGroupMenu(i64),
     SearchChanged(String),
 
     NewAccount,
     EditAccount(i64),
     DeleteAccount(i64),
+    TogglePin(i64),
+
+    ResizeColumn(ColumnId, i32),
 
     EditSite(String),
     EditFieldKey(usize, String),
@@ -320,6 +347,7 @@ impl App {
                     st.selected_group = Some(id);
                     st.accounts = st.db.list_accounts(id).unwrap_or_default();
                     st.editor = None;
+                    st.group_menu_open = None;
                     st.search.clear();
                 }
             }
@@ -359,12 +387,14 @@ impl App {
                     if matches!(&st.renaming_group, Some((rid, _)) if *rid == id) {
                         st.renaming_group = None;
                     }
+                    st.group_menu_open = None;
                 }
             }
             Message::StartRenameGroup(id) => {
                 if let Screen::Main(st) = self.active_mut() {
                     if let Some(g) = st.groups.iter().find(|g| g.id == id) {
                         st.renaming_group = Some((id, g.name.clone()));
+                        st.group_menu_open = None;
                         st.error = None;
                     }
                 }
@@ -401,6 +431,15 @@ impl App {
                     st.error = None;
                 }
             }
+            Message::ToggleGroupMenu(id) => {
+                if let Screen::Main(st) = self.active_mut() {
+                    st.group_menu_open = if st.group_menu_open == Some(id) {
+                        None
+                    } else {
+                        Some(id)
+                    };
+                }
+            }
 
             Message::NewAccount => {
                 if let Screen::Main(st) = self.active_mut() {
@@ -431,6 +470,46 @@ impl App {
                     }
                 }
             }
+            Message::TogglePin(id) => {
+                if let Screen::Main(st) = self.active_mut() {
+                    if let Some(a) = st.accounts.iter().find(|a| a.id == id) {
+                        let new_state = !a.pinned;
+                        let _ = st.db.set_pinned(id, new_state);
+                        if let Some(gid) = st.selected_group {
+                            st.accounts = st.db.list_accounts(gid).unwrap_or_default();
+                        }
+                    }
+                }
+            }
+            Message::ResizeColumn(col, delta) => {
+                if let Screen::Main(st) = self.active_mut() {
+                    let d = delta as f32;
+                    match col {
+                        ColumnId::Site => {
+                            st.site_width = (st.site_width + d)
+                                .clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH);
+                            let _ = st.db.set_pref(PREF_COL_SITE, &st.site_width.to_string());
+                        }
+                        ColumnId::Actions => {
+                            st.actions_width = (st.actions_width + d)
+                                .clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH);
+                            let _ = st
+                                .db
+                                .set_pref(PREF_COL_ACTIONS, &st.actions_width.to_string());
+                        }
+                        ColumnId::Field(k) => {
+                            let cur = *st
+                                .field_widths
+                                .get(&k)
+                                .unwrap_or(&DEFAULT_FIELD_WIDTH);
+                            let new_w = (cur + d).clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH);
+                            st.field_widths.insert(k.clone(), new_w);
+                            let pref_key = format!("{PREF_COL_FIELD_PREFIX}{k}");
+                            let _ = st.db.set_pref(&pref_key, &new_w.to_string());
+                        }
+                    }
+                }
+            }
 
             Message::EditSite(s) => edit_editor(self.active_mut(), |e| e.site = s),
             Message::EditFieldKey(idx, s) => edit_editor(self.active_mut(), |e| {
@@ -458,10 +537,17 @@ impl App {
                             st.error = Some("Site is required".into());
                             return Task::none();
                         }
+                        let prev_pinned = st
+                            .accounts
+                            .iter()
+                            .find(|x| x.id == e.id)
+                            .map(|x| x.pinned)
+                            .unwrap_or(false);
                         let a = Account {
                             id: e.id,
                             group_id: gid,
                             site: e.site.clone(),
+                            pinned: prev_pinned,
                             fields: e.fields.clone(),
                         };
                         match st.db.upsert_account(&a) {
@@ -764,6 +850,26 @@ fn enter_main(db_path: PathBuf, db: Db, salt: Option<[u8; SALT_LEN]>) -> MainSta
         Some(gid) => db.list_accounts(gid).unwrap_or_default(),
         None => vec![],
     };
+
+    let prefs = db.load_prefs().unwrap_or_default();
+    let parse_width = |v: &String| v.parse::<f32>().ok();
+    let site_width = prefs
+        .get(PREF_COL_SITE)
+        .and_then(parse_width)
+        .unwrap_or(DEFAULT_SITE_WIDTH);
+    let actions_width = prefs
+        .get(PREF_COL_ACTIONS)
+        .and_then(parse_width)
+        .unwrap_or(DEFAULT_ACTIONS_WIDTH);
+    let mut field_widths = HashMap::new();
+    for (k, v) in &prefs {
+        if let Some(field_key) = k.strip_prefix(PREF_COL_FIELD_PREFIX) {
+            if let Some(w) = parse_width(v) {
+                field_widths.insert(field_key.to_string(), w);
+            }
+        }
+    }
+
     MainState {
         db_path,
         db,
@@ -776,7 +882,11 @@ fn enter_main(db_path: PathBuf, db: Db, salt: Option<[u8; SALT_LEN]>) -> MainSta
         editor: None,
         error: None,
         renaming_group: None,
+        group_menu_open: None,
         settings: None,
+        site_width,
+        actions_width,
+        field_widths,
     }
 }
 
@@ -959,20 +1069,40 @@ fn main_view<'a>(st: &'a MainState, config: &'a AppConfig) -> Element<'a, Messag
         } else {
             name_btn.style(button::text)
         };
-        groups_col = groups_col.push(
+        let menu_open = st.group_menu_open == Some(g.id);
+        let actions: Element<Message> = if menu_open {
             row![
-                name_btn,
+                button(text("Delete").size(11))
+                    .padding([4, 8])
+                    .on_press(Message::DeleteGroup(g.id))
+                    .style(button::danger),
+                button(text("Cancel").size(11))
+                    .padding([4, 8])
+                    .on_press(Message::ToggleGroupMenu(g.id))
+                    .style(button::secondary),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            row![
                 button(text("Edit").size(11))
                     .padding([4, 8])
                     .on_press(Message::StartRenameGroup(g.id))
                     .style(button::secondary),
-                button(text("×").size(14))
+                button(text("…").size(11))
                     .padding([4, 8])
-                    .on_press(Message::DeleteGroup(g.id))
-                    .style(button::danger),
+                    .on_press(Message::ToggleGroupMenu(g.id))
+                    .style(button::secondary),
             ]
             .spacing(4)
-            .align_y(Alignment::Center),
+            .align_y(Alignment::Center)
+            .into()
+        };
+        groups_col = groups_col.push(
+            row![name_btn, actions]
+                .spacing(4)
+                .align_y(Alignment::Center),
         );
     }
     groups_col = groups_col.push(vertical_space().height(Length::Fixed(8.0)));
@@ -1004,7 +1134,7 @@ fn main_view<'a>(st: &'a MainState, config: &'a AppConfig) -> Element<'a, Messag
     } else if let Some(editor) = &st.editor {
         editor_view(editor, st.error.as_deref())
     } else {
-        accounts_view(&st.accounts, &st.search, st.selected_group.is_some())
+        accounts_view(st)
     };
 
     let header = container(
@@ -1040,33 +1170,26 @@ fn main_view<'a>(st: &'a MainState, config: &'a AppConfig) -> Element<'a, Messag
     .into()
 }
 
-fn accounts_view<'a>(
-    accounts: &'a [Account],
-    search: &'a str,
-    has_group: bool,
-) -> Element<'a, Message> {
+fn accounts_view(st: &MainState) -> Element<'_, Message> {
+    let has_group = st.selected_group.is_some();
     let add_btn = button(text("+ Add Account").size(13))
         .padding([8, 14])
         .on_press_maybe(has_group.then_some(Message::NewAccount))
         .style(button::primary);
 
-    let header = row![
-        text("Accounts").size(22),
-        horizontal_space(),
-        add_btn,
-    ]
-    .align_y(Alignment::Center);
+    let header = row![text("Accounts").size(22), horizontal_space(), add_btn]
+        .align_y(Alignment::Center);
 
-    let search_bar = text_input("Search accounts…", search)
+    let search_bar = text_input("Search accounts…", &st.search)
         .on_input(Message::SearchChanged)
         .padding(10)
         .size(14);
 
-    let q = search.trim().to_lowercase();
+    let q = st.search.trim().to_lowercase();
     let filtered: Vec<&Account> = if q.is_empty() {
-        accounts.iter().collect()
+        st.accounts.iter().collect()
     } else {
-        accounts
+        st.accounts
             .iter()
             .filter(|a| {
                 a.site.to_lowercase().contains(&q)
@@ -1078,20 +1201,49 @@ fn accounts_view<'a>(
             .collect()
     };
 
-    let body: Element<'a, Message> = if !has_group {
+    let body: Element<Message> = if !has_group {
         empty_state("Select or create a group to get started.")
-    } else if accounts.is_empty() {
+    } else if st.accounts.is_empty() {
         empty_state("No accounts yet. Click \"+ Add Account\" to create one.")
     } else if filtered.is_empty() {
         empty_state("No accounts match your search.")
     } else {
-        accounts_table(&filtered)
+        accounts_table(st, &filtered)
     };
 
     column![header, search_bar, body].spacing(14).into()
 }
 
-fn accounts_table<'a>(accounts: &[&'a Account]) -> Element<'a, Message> {
+fn resize_buttons(col: ColumnId) -> Element<'static, Message> {
+    row![
+        button(text("−").size(10))
+            .padding([1, 5])
+            .on_press(Message::ResizeColumn(col.clone(), -(COLUMN_STEP as i32)))
+            .style(button::secondary),
+        button(text("+").size(10))
+            .padding([1, 5])
+            .on_press(Message::ResizeColumn(col, COLUMN_STEP as i32))
+            .style(button::secondary),
+    ]
+    .spacing(2)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn header_cell(label: String, width: Length, col: ColumnId) -> Element<'static, Message> {
+    container(
+        row![
+            text(label).size(12).color(MUTED).width(Length::Fill),
+            resize_buttons(col),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    )
+    .width(width)
+    .into()
+}
+
+fn accounts_table<'a>(st: &'a MainState, accounts: &[&'a Account]) -> Element<'a, Message> {
     let mut keys: Vec<String> = Vec::new();
     for a in accounts {
         for f in &a.fields {
@@ -1103,20 +1255,36 @@ fn accounts_table<'a>(accounts: &[&'a Account]) -> Element<'a, Message> {
     }
     keys.sort();
 
-    let site_w = Length::Fixed(200.0);
-    let field_w = Length::Fixed(180.0);
-    let actions_w = Length::Fixed(120.0);
+    let site_len = Length::Fixed(st.site_width);
+    let actions_len = Length::Fixed(st.actions_width);
+    let field_len = |k: &str| -> Length {
+        Length::Fixed(
+            *st.field_widths
+                .get(k)
+                .unwrap_or(&DEFAULT_FIELD_WIDTH),
+        )
+    };
 
-    let mut header_row = row![text("Site").size(12).color(MUTED).width(site_w)].spacing(10);
+    let mut header_row =
+        row![header_cell("Site".to_string(), site_len, ColumnId::Site)].spacing(10);
     for k in &keys {
-        header_row = header_row.push(text(k.clone()).size(12).color(MUTED).width(field_w));
+        header_row = header_row.push(header_cell(
+            k.clone(),
+            field_len(k),
+            ColumnId::Field(k.clone()),
+        ));
     }
-    header_row = header_row.push(text("").width(actions_w));
+    header_row = header_row.push(header_cell(String::new(), actions_len, ColumnId::Actions));
 
     let mut body_col = column![container(header_row).padding([6, 10])].spacing(0);
 
     for (i, a) in accounts.iter().enumerate() {
-        let mut r = row![text(a.site.clone()).size(13).width(site_w)]
+        let site_label = if a.pinned {
+            format!("★ {}", a.site)
+        } else {
+            a.site.clone()
+        };
+        let mut r = row![text(site_label).size(13).width(site_len)]
             .spacing(10)
             .align_y(Alignment::Center);
         for k in &keys {
@@ -1127,25 +1295,34 @@ fn accounts_table<'a>(accounts: &[&'a Account]) -> Element<'a, Message> {
                 .map(|f| f.value.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            r = r.push(text(joined).size(13).width(field_w));
+            r = r.push(text(joined).size(13).width(field_len(k)));
         }
+        let pin_label = if a.pinned { "Unpin" } else { "Pin" };
         r = r.push(
             row![
+                button(text(pin_label).size(11))
+                    .padding([4, 8])
+                    .on_press(Message::TogglePin(a.id))
+                    .style(if a.pinned {
+                        button::primary
+                    } else {
+                        button::secondary
+                    }),
                 button(text("Edit").size(11))
-                    .padding([4, 10])
+                    .padding([4, 8])
                     .on_press(Message::EditAccount(a.id))
                     .style(button::secondary),
                 button(text("Del").size(11))
-                    .padding([4, 10])
+                    .padding([4, 8])
                     .on_press(Message::DeleteAccount(a.id))
                     .style(button::danger),
             ]
             .spacing(4)
-            .width(actions_w),
+            .width(actions_len),
         );
 
         let mut row_c = container(r).padding([10, 10]).width(Length::Shrink);
-        if i % 2 == 1 {
+        if a.pinned || i % 2 == 1 {
             row_c = row_c.style(container::rounded_box);
         }
         body_col = body_col.push(row_c);
