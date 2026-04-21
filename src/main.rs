@@ -1,15 +1,15 @@
 mod crypto;
 mod db;
 mod model;
-mod paths;
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use iced::widget::{
     button, column, container, horizontal_rule, horizontal_space, row, scrollable, text,
-    text_input,
+    text_input, vertical_space,
 };
-use iced::{Alignment, Color, Element, Length, Task};
+use iced::{Alignment, Color, Element, Length, Task, Theme};
 use zeroize::Zeroize;
 
 use db::Db;
@@ -17,7 +17,8 @@ use model::{Account, Field, Group};
 
 fn main() -> iced::Result {
     iced::application("Account Manager", App::update, App::view)
-        .window_size((960.0, 640.0))
+        .theme(|_| Theme::TokyoNight)
+        .window_size((1080.0, 720.0))
         .run_with(App::new)
 }
 
@@ -55,6 +56,7 @@ struct MainState {
     new_group_name: String,
     search: String,
     editor: Option<AccountEditor>,
+    error: Option<String>,
 }
 
 #[derive(Default)]
@@ -300,16 +302,26 @@ impl App {
             Message::EditSave => {
                 if let Screen::Main(st) = &mut self.screen {
                     if let (Some(gid), Some(e)) = (st.selected_group, &st.editor) {
+                        if e.site.trim().is_empty() {
+                            st.error = Some("Site is required".into());
+                            return Task::none();
+                        }
                         let a = Account {
                             id: e.id,
                             group_id: gid,
                             site: e.site.clone(),
                             fields: e.fields.clone(),
                         };
-                        if !a.site.trim().is_empty() {
-                            let _ = st.db.upsert_account(&a);
-                            st.accounts = st.db.list_accounts(gid).unwrap_or_default();
-                            st.editor = None;
+                        match st.db.upsert_account(&a) {
+                            Ok(_) => match st.db.list_accounts(gid) {
+                                Ok(list) => {
+                                    st.accounts = list;
+                                    st.editor = None;
+                                    st.error = None;
+                                }
+                                Err(err) => st.error = Some(format!("Reload failed: {err}")),
+                            },
+                            Err(err) => st.error = Some(format!("Save failed: {err}")),
                         }
                     }
                 }
@@ -317,6 +329,7 @@ impl App {
             Message::EditCancel => {
                 if let Screen::Main(st) = &mut self.screen {
                     st.editor = None;
+                    st.error = None;
                 }
             }
         }
@@ -345,80 +358,103 @@ fn edit_editor(screen: &mut Screen, f: impl FnOnce(&mut AccountEditor)) {
 
 fn pick_open_path() -> Option<PathBuf> {
     rfd::FileDialog::new()
-        .add_filter("Account Manager Profile", &["db"])
+        .add_filter("Account Manager Profile", &["am"])
         .pick_file()
 }
 
 fn pick_new_path() -> Option<PathBuf> {
     rfd::FileDialog::new()
-        .add_filter("Account Manager Profile", &["db"])
-        .set_file_name("profile.db")
+        .add_filter("Account Manager Profile", &["am"])
+        .set_file_name("profile.am")
         .save_file()
         .map(|p| {
-            if p.extension().and_then(|s| s.to_str()) == Some("db") {
+            if p.extension().and_then(|s| s.to_str()) == Some("am") {
                 p
             } else {
-                p.with_extension("db")
+                p.with_extension("am")
             }
         })
 }
 
 // ---------- profile I/O ----------
 
-fn is_encrypted(db_path: &Path) -> bool {
-    paths::salt_path_for(db_path).exists()
+// Plain SQLite databases begin with this exact 16-byte magic string.
+// SQLCipher-encrypted databases do not (the header is encrypted; the first
+// 16 bytes are the random salt).
+const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+
+fn read_file_head(path: &Path, n: usize) -> Result<Vec<u8>, std::io::Error> {
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; n];
+    let mut read = 0;
+    while read < n {
+        match f.read(&mut buf[read..])? {
+            0 => break,
+            m => read += m,
+        }
+    }
+    buf.truncate(read);
+    Ok(buf)
 }
 
-fn create_profile(db_path: &Path, password: &str) -> Result<(), String> {
-    let salt_path = paths::salt_path_for(db_path);
-    // save dialog already confirmed replace intent if the file existed
-    if db_path.exists() {
-        std::fs::remove_file(db_path).map_err(|e| e.to_string())?;
+fn is_encrypted(path: &Path) -> bool {
+    match read_file_head(path, 16) {
+        Ok(bytes) if bytes.len() == 16 => bytes.as_slice() != SQLITE_MAGIC.as_slice(),
+        _ => false,
     }
-    if salt_path.exists() {
-        std::fs::remove_file(&salt_path).map_err(|e| e.to_string())?;
+}
+
+fn create_profile(path: &Path, password: &str) -> Result<(), String> {
+    // save dialog already confirmed replace intent if the file existed
+    if path.exists() {
+        std::fs::remove_file(path).map_err(|e| e.to_string())?;
     }
 
     if password.is_empty() {
         let result = (|| -> Result<(), String> {
-            let db = Db::open(db_path, None)?;
+            let db = Db::open(path, None, None)?;
             db.init_schema()?;
+            db.add_group("Main")?;
             Ok(())
         })();
         if result.is_err() {
-            let _ = std::fs::remove_file(db_path);
+            let _ = std::fs::remove_file(path);
         }
         return result;
     }
 
     let salt = crypto::generate_salt();
     let mut key = crypto::derive_key(password, &salt)?;
-    std::fs::write(&salt_path, salt).map_err(|e| e.to_string())?;
 
     let result = (|| -> Result<(), String> {
-        let db = Db::open(db_path, Some(&key))?;
+        let db = Db::open(path, Some(&key), Some(&salt))?;
         db.init_schema()?;
+        db.add_group("Main")?;
         Ok(())
     })();
     key.zeroize();
 
     if result.is_err() {
-        let _ = std::fs::remove_file(db_path);
-        let _ = std::fs::remove_file(&salt_path);
+        let _ = std::fs::remove_file(path);
     }
     result
 }
 
-fn open_profile(db_path: &Path, password: &str) -> Result<Db, String> {
-    if !is_encrypted(db_path) {
-        return Db::open(db_path, None);
-    }
-    let salt_path = paths::salt_path_for(db_path);
-    let salt = std::fs::read(&salt_path).map_err(|e| format!("missing salt: {e}"))?;
-    let mut key = crypto::derive_key(password, &salt)?;
-    let result = Db::open(db_path, Some(&key));
-    key.zeroize();
-    result
+fn open_profile(path: &Path, password: &str) -> Result<Db, String> {
+    let db = if !is_encrypted(path) {
+        Db::open(path, None, None)?
+    } else {
+        let salt = read_file_head(path, 16).map_err(|e| format!("read salt: {e}"))?;
+        if salt.len() != 16 {
+            return Err("file too short to contain salt".into());
+        }
+        let mut key = crypto::derive_key(password, &salt)?;
+        let result = Db::open(path, Some(&key), None);
+        key.zeroize();
+        result?
+    };
+    db.init_schema()?;
+    Ok(db)
 }
 
 fn enter_main(db_path: PathBuf, db: Db) -> MainState {
@@ -437,6 +473,7 @@ fn enter_main(db_path: PathBuf, db: Db) -> MainState {
         new_group_name: String::new(),
         search: String::new(),
         editor: None,
+        error: None,
     }
 }
 
@@ -451,137 +488,213 @@ fn display_name(p: &Path) -> String {
 
 fn start_view(error: Option<&str>) -> Element<'_, Message> {
     let mut c = column![
-        text("Account Manager").size(28),
-        text("Each profile is a .db file you choose the location for.").size(13),
-        button(text("Open Profile...").size(15))
+        text("Account Manager").size(32),
+        text("A profile is a .db file you choose the location for.")
+            .size(13)
+            .color(MUTED),
+        vertical_space().height(Length::Fixed(8.0)),
+        button(text("Open Profile...").size(15).center())
+            .padding(12)
             .on_press(Message::PickOpenPath)
-            .width(Length::Fill),
-        button(text("New Profile...").size(15))
+            .width(Length::Fill)
+            .style(button::primary),
+        button(text("New Profile...").size(15).center())
+            .padding(12)
             .on_press(Message::PickNewPath)
-            .width(Length::Fill),
+            .width(Length::Fill)
+            .style(button::secondary),
     ]
-    .spacing(12)
-    .max_width(420);
+    .spacing(10);
 
     if let Some(e) = error {
-        c = c.push(text(e.to_string()).color(Color::from_rgb(0.85, 0.2, 0.2)));
+        c = c.push(error_text(e));
     }
 
-    container(c).padding(24).center_x(Length::Fill).into()
+    let card = container(c)
+        .padding(28)
+        .width(Length::Fixed(420.0))
+        .style(container::rounded_box);
+
+    container(card)
+        .padding(24)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .into()
 }
 
 fn create_profile_view(st: &CreateProfileState) -> Element<'_, Message> {
     let mut c = column![
-        text("Create Profile").size(24),
-        text(format!("File: {}", st.db_path.display())).size(12),
+        text("Create Profile").size(26),
+        text(format!("File: {}", st.db_path.display()))
+            .size(12)
+            .color(MUTED),
+        vertical_space().height(Length::Fixed(6.0)),
         text_input("Master password (leave blank for unencrypted)", &st.password)
             .on_input(Message::CreatePasswordChanged)
             .secure(true)
-            .padding(8),
+            .padding(10),
         text_input("Confirm password", &st.confirm)
             .on_input(Message::CreateConfirmChanged)
             .on_submit(Message::CreateSubmit)
             .secure(true)
-            .padding(8),
+            .padding(10),
     ]
-    .spacing(12);
+    .spacing(10);
     if let Some(e) = &st.error {
-        c = c.push(text(e.clone()).color(Color::from_rgb(0.85, 0.2, 0.2)));
+        c = c.push(error_text(e));
     }
     c = c.push(
         row![
-            button(text("Create")).on_press(Message::CreateSubmit),
-            button(text("Cancel")).on_press(Message::CreateCancel),
+            button(text("Create").size(14))
+                .padding([8, 18])
+                .on_press(Message::CreateSubmit)
+                .style(button::primary),
+            button(text("Cancel").size(14))
+                .padding([8, 18])
+                .on_press(Message::CreateCancel)
+                .style(button::secondary),
         ]
-        .spacing(8),
+        .spacing(10),
     );
-    container(column![c].max_width(520))
+
+    let card = container(c)
+        .padding(28)
+        .width(Length::Fixed(520.0))
+        .style(container::rounded_box);
+
+    container(card)
         .padding(24)
         .center_x(Length::Fill)
+        .center_y(Length::Fill)
         .into()
 }
 
 fn unlock_view(st: &UnlockState) -> Element<'_, Message> {
     let mut c = column![
-        text(format!("Unlock '{}'", display_name(&st.db_path))).size(24),
-        text(format!("File: {}", st.db_path.display())).size(12),
+        text(format!("Unlock '{}'", display_name(&st.db_path))).size(26),
+        text(format!("File: {}", st.db_path.display()))
+            .size(12)
+            .color(MUTED),
+        vertical_space().height(Length::Fixed(6.0)),
         text_input("Password", &st.password)
             .on_input(Message::UnlockPasswordChanged)
             .on_submit(Message::UnlockSubmit)
             .secure(true)
-            .padding(8),
+            .padding(10),
     ]
-    .spacing(12);
+    .spacing(10);
     if let Some(e) = &st.error {
-        c = c.push(text(e.clone()).color(Color::from_rgb(0.85, 0.2, 0.2)));
+        c = c.push(error_text(e));
     }
     c = c.push(
         row![
-            button(text("Unlock")).on_press(Message::UnlockSubmit),
-            button(text("Back")).on_press(Message::UnlockCancel),
+            button(text("Unlock").size(14))
+                .padding([8, 18])
+                .on_press(Message::UnlockSubmit)
+                .style(button::primary),
+            button(text("Back").size(14))
+                .padding([8, 18])
+                .on_press(Message::UnlockCancel)
+                .style(button::secondary),
         ]
-        .spacing(8),
+        .spacing(10),
     );
-    container(column![c].max_width(520))
+
+    let card = container(c)
+        .padding(28)
+        .width(Length::Fixed(520.0))
+        .style(container::rounded_box);
+
+    container(card)
         .padding(24)
         .center_x(Length::Fill)
+        .center_y(Length::Fill)
         .into()
 }
 
 fn main_view(st: &MainState) -> Element<'_, Message> {
-    let mut groups_col = column![text("Groups").size(16)].spacing(4);
+    let mut groups_col = column![
+        text("GROUPS").size(11).color(MUTED),
+        vertical_space().height(Length::Fixed(4.0)),
+    ]
+    .spacing(4);
+
     for g in &st.groups {
         let selected = st.selected_group == Some(g.id);
-        let label = if selected {
-            format!("▸ {}", g.name)
+        let mut name_btn = button(text(g.name.clone()).size(14))
+            .width(Length::Fill)
+            .padding([6, 10])
+            .on_press(Message::SelectGroup(g.id));
+        name_btn = if selected {
+            name_btn.style(button::primary)
         } else {
-            g.name.clone()
+            name_btn.style(button::text)
         };
         groups_col = groups_col.push(
             row![
-                button(text(label).size(14))
-                    .width(Length::Fill)
-                    .on_press(Message::SelectGroup(g.id)),
-                button(text("x").size(12)).on_press(Message::DeleteGroup(g.id)),
+                name_btn,
+                button(text("×").size(14))
+                    .padding([4, 8])
+                    .on_press(Message::DeleteGroup(g.id))
+                    .style(button::danger),
             ]
-            .spacing(4),
+            .spacing(4)
+            .align_y(Alignment::Center),
         );
     }
+    groups_col = groups_col.push(vertical_space().height(Length::Fixed(8.0)));
+    groups_col = groups_col.push(horizontal_rule(1));
+    groups_col = groups_col.push(vertical_space().height(Length::Fixed(4.0)));
     groups_col = groups_col.push(
         row![
             text_input("New group", &st.new_group_name)
                 .on_input(Message::NewGroupNameChanged)
                 .on_submit(Message::AddGroup)
-                .padding(6),
-            button(text("+")).on_press(Message::AddGroup),
+                .padding(8),
+            button(text("+").size(14))
+                .padding([6, 12])
+                .on_press(Message::AddGroup)
+                .style(button::primary),
         ]
-        .spacing(4),
+        .spacing(6)
+        .align_y(Alignment::Center),
     );
 
-    let sidebar = container(scrollable(groups_col))
-        .width(Length::Fixed(220.0))
+    let sidebar = container(scrollable(groups_col).height(Length::Fill))
+        .width(Length::Fixed(240.0))
         .height(Length::Fill)
-        .padding(12);
+        .padding(16)
+        .style(container::bordered_box);
 
     let body: Element<Message> = if let Some(editor) = &st.editor {
-        editor_view(editor)
+        editor_view(editor, st.error.as_deref())
     } else {
         accounts_view(&st.accounts, &st.search, st.selected_group.is_some())
     };
 
-    let header = row![
-        text(format!("Profile: {}", display_name(&st.db_path))).size(18),
-        horizontal_space(),
-        button(text("Lock")).on_press(Message::LockProfile),
-    ]
-    .align_y(Alignment::Center)
-    .padding(8);
+    let header = container(
+        row![
+            text(format!("Profile: {}", display_name(&st.db_path)))
+                .size(18),
+            horizontal_space(),
+            button(text("Lock").size(13))
+                .padding([6, 14])
+                .on_press(Message::LockProfile)
+                .style(button::secondary),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .padding([12, 18]);
 
     column![
         header,
+        horizontal_rule(1),
         row![
             sidebar,
-            container(body).width(Length::Fill).height(Length::Fill).padding(12),
+            container(body)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(20),
         ]
     ]
     .into()
@@ -592,15 +705,22 @@ fn accounts_view<'a>(
     search: &'a str,
     has_group: bool,
 ) -> Element<'a, Message> {
-    let add_btn = button(text("+ Add Account"))
-        .on_press_maybe(has_group.then_some(Message::NewAccount));
+    let add_btn = button(text("+ Add Account").size(13))
+        .padding([8, 14])
+        .on_press_maybe(has_group.then_some(Message::NewAccount))
+        .style(button::primary);
 
-    let header = row![text("Accounts").size(20), horizontal_space(), add_btn]
-        .align_y(Alignment::Center);
+    let header = row![
+        text("Accounts").size(22),
+        horizontal_space(),
+        add_btn,
+    ]
+    .align_y(Alignment::Center);
 
-    let search_bar = text_input("Search site, email, region, payment, notes", search)
+    let search_bar = text_input("Search accounts…", search)
         .on_input(Message::SearchChanged)
-        .padding(8);
+        .padding(10)
+        .size(14);
 
     let q = search.trim().to_lowercase();
     let filtered: Vec<&Account> = if q.is_empty() {
@@ -619,16 +739,16 @@ fn accounts_view<'a>(
     };
 
     let body: Element<'a, Message> = if !has_group {
-        text("Select or create a group.").into()
+        empty_state("Select or create a group to get started.")
     } else if accounts.is_empty() {
-        text("No accounts yet.").into()
+        empty_state("No accounts yet. Click \"+ Add Account\" to create one.")
     } else if filtered.is_empty() {
-        text("No accounts match the search.").into()
+        empty_state("No accounts match your search.")
     } else {
         accounts_table(&filtered)
     };
 
-    column![header, search_bar, body].spacing(12).into()
+    column![header, search_bar, body].spacing(14).into()
 }
 
 fn accounts_table<'a>(accounts: &[&'a Account]) -> Element<'a, Message> {
@@ -643,20 +763,22 @@ fn accounts_table<'a>(accounts: &[&'a Account]) -> Element<'a, Message> {
     }
     keys.sort();
 
-    let site_w = Length::Fixed(180.0);
-    let field_w = Length::Fixed(160.0);
-    let actions_w = Length::Fixed(110.0);
+    let site_w = Length::Fixed(200.0);
+    let field_w = Length::Fixed(180.0);
+    let actions_w = Length::Fixed(120.0);
 
-    let mut header_row = row![text("Site").size(14).width(site_w)].spacing(8);
+    let mut header_row = row![text("Site").size(12).color(MUTED).width(site_w)].spacing(10);
     for k in &keys {
-        header_row = header_row.push(text(k.clone()).size(14).width(field_w));
+        header_row = header_row.push(text(k.clone()).size(12).color(MUTED).width(field_w));
     }
     header_row = header_row.push(text("").width(actions_w));
 
-    let mut body_col = column![header_row, horizontal_rule(1)].spacing(4);
+    let mut body_col = column![container(header_row).padding([6, 10])].spacing(0);
 
-    for a in accounts {
-        let mut r = row![text(a.site.clone()).size(13).width(site_w)].spacing(8);
+    for (i, a) in accounts.iter().enumerate() {
+        let mut r = row![text(a.site.clone()).size(13).width(site_w)]
+            .spacing(10)
+            .align_y(Alignment::Center);
         for k in &keys {
             let joined = a
                 .fields
@@ -669,13 +791,24 @@ fn accounts_table<'a>(accounts: &[&'a Account]) -> Element<'a, Message> {
         }
         r = r.push(
             row![
-                button(text("Edit").size(11)).on_press(Message::EditAccount(a.id)),
-                button(text("Del").size(11)).on_press(Message::DeleteAccount(a.id)),
+                button(text("Edit").size(11))
+                    .padding([4, 10])
+                    .on_press(Message::EditAccount(a.id))
+                    .style(button::secondary),
+                button(text("Del").size(11))
+                    .padding([4, 10])
+                    .on_press(Message::DeleteAccount(a.id))
+                    .style(button::danger),
             ]
             .spacing(4)
             .width(actions_w),
         );
-        body_col = body_col.push(r);
+
+        let mut row_c = container(r).padding([10, 10]).width(Length::Shrink);
+        if i % 2 == 1 {
+            row_c = row_c.style(container::rounded_box);
+        }
+        body_col = body_col.push(row_c);
     }
 
     scrollable(body_col)
@@ -683,20 +816,38 @@ fn accounts_table<'a>(accounts: &[&'a Account]) -> Element<'a, Message> {
             vertical: scrollable::Scrollbar::default(),
             horizontal: scrollable::Scrollbar::default(),
         })
+        .width(Length::Fill)
+        .height(Length::Fill)
         .into()
 }
 
-fn editor_view(e: &AccountEditor) -> Element<'_, Message> {
+fn empty_state(msg: &str) -> Element<'_, Message> {
+    container(text(msg.to_string()).size(14).color(MUTED))
+        .padding(32)
+        .center_x(Length::Fill)
+        .into()
+}
+
+fn editor_view<'a>(e: &'a AccountEditor, error: Option<&'a str>) -> Element<'a, Message> {
     let title = if e.id == 0 { "New Account" } else { "Edit Account" };
 
     let mut col = column![
-        text(title).size(22),
-        text_input("Site (e.g. Netflix)", &e.site)
+        text(title).size(24),
+        vertical_space().height(Length::Fixed(2.0)),
+        text("SITE").size(11).color(MUTED),
+        text_input("e.g. Netflix", &e.site)
             .on_input(Message::EditSite)
-            .padding(8),
-        text("Fields").size(14),
+            .on_submit(Message::EditSave)
+            .padding(10)
+            .size(14),
+        vertical_space().height(Length::Fixed(6.0)),
+        text("FIELDS").size(11).color(MUTED),
     ]
-    .spacing(10);
+    .spacing(6);
+
+    if let Some(err) = error {
+        col = col.push(error_text(err));
+    }
 
     for (i, f) in e.fields.iter().enumerate() {
         col = col.push(
@@ -704,27 +855,73 @@ fn editor_view(e: &AccountEditor) -> Element<'_, Message> {
                 text_input("Key (e.g. email)", &f.key)
                     .on_input(move |s| Message::EditFieldKey(i, s))
                     .width(Length::FillPortion(2))
-                    .padding(6),
+                    .padding(8)
+                    .size(13),
                 text_input("Value", &f.value)
                     .on_input(move |s| Message::EditFieldValue(i, s))
                     .width(Length::FillPortion(3))
-                    .padding(6),
-                button(text("x").size(12)).on_press(Message::RemoveField(i)),
+                    .padding(8)
+                    .size(13),
+                button(text("×").size(14))
+                    .padding([4, 10])
+                    .on_press(Message::RemoveField(i))
+                    .style(button::danger),
             ]
-            .spacing(6)
+            .spacing(8)
             .align_y(Alignment::Center),
         );
     }
 
-    col = col.push(button(text("+ Add Field")).on_press(Message::AddField));
-
     col = col.push(
-        row![
-            button(text("Save")).on_press(Message::EditSave),
-            button(text("Cancel")).on_press(Message::EditCancel),
-        ]
-        .spacing(8),
+        button(text("+ Add Field").size(13))
+            .padding([6, 14])
+            .on_press(Message::AddField)
+            .style(button::secondary),
     );
 
-    scrollable(col.max_width(600)).into()
+    col = col.push(vertical_space().height(Length::Fixed(8.0)));
+    col = col.push(horizontal_rule(1));
+    col = col.push(
+        row![
+            button(text("Save").size(14))
+                .padding([8, 20])
+                .on_press(Message::EditSave)
+                .style(button::primary),
+            button(text("Cancel").size(14))
+                .padding([8, 20])
+                .on_press(Message::EditCancel)
+                .style(button::secondary),
+        ]
+        .spacing(10),
+    );
+
+    let card = container(col.max_width(640))
+        .padding(24)
+        .width(Length::Fill)
+        .style(container::rounded_box);
+
+    scrollable(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+// ---------- shared view helpers ----------
+
+const MUTED: Color = Color {
+    r: 0.6,
+    g: 0.6,
+    b: 0.68,
+    a: 1.0,
+};
+
+const DANGER: Color = Color {
+    r: 0.92,
+    g: 0.36,
+    b: 0.36,
+    a: 1.0,
+};
+
+fn error_text(msg: &str) -> Element<'_, Message> {
+    text(msg.to_string()).size(13).color(DANGER).into()
 }

@@ -11,9 +11,18 @@ pub struct Db {
 }
 
 impl Db {
-    pub fn open(path: &Path, key: Option<&[u8]>) -> Result<Self, String> {
+    pub fn open(path: &Path, key: Option<&[u8]>, salt: Option<&[u8]>) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
         if let Some(k) = key {
+            if let Some(s) = salt {
+                // cipher_salt must be set before or with the key so SQLCipher
+                // uses our Argon2 salt as the file salt (first 16 bytes).
+                let mut salt_hex = key_to_hex(s);
+                let pragma = format!("PRAGMA cipher_salt = \"x'{}'\";", salt_hex);
+                let result = conn.execute_batch(&pragma);
+                salt_hex.zeroize();
+                result.map_err(|e| e.to_string())?;
+            }
             let mut hex = key_to_hex(k);
             let pragma = format!("PRAGMA key = \"x'{}'\";", hex);
             let result = conn.execute_batch(&pragma);
