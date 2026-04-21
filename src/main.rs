@@ -6,13 +6,14 @@ mod paths;
 use std::path::{Path, PathBuf};
 
 use iced::widget::{
-    button, column, container, horizontal_space, row, scrollable, text, text_input,
+    button, column, container, horizontal_rule, horizontal_space, row, scrollable, text,
+    text_input,
 };
 use iced::{Alignment, Color, Element, Length, Task};
 use zeroize::Zeroize;
 
 use db::Db;
-use model::{Account, Group};
+use model::{Account, Field, Group};
 
 fn main() -> iced::Result {
     iced::application("Account Manager", App::update, App::view)
@@ -60,10 +61,7 @@ struct MainState {
 struct AccountEditor {
     id: i64,
     site: String,
-    email: String,
-    region: String,
-    payment_methods: String,
-    notes: String,
+    fields: Vec<Field>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,10 +90,10 @@ enum Message {
     DeleteAccount(i64),
 
     EditSite(String),
-    EditEmail(String),
-    EditRegion(String),
-    EditPayment(String),
-    EditNotes(String),
+    EditFieldKey(usize, String),
+    EditFieldValue(usize, String),
+    AddField,
+    RemoveField(usize),
     EditSave,
     EditCancel,
 }
@@ -253,7 +251,10 @@ impl App {
             Message::NewAccount => {
                 if let Screen::Main(st) = &mut self.screen {
                     if st.selected_group.is_some() {
-                        st.editor = Some(AccountEditor::default());
+                        st.editor = Some(AccountEditor {
+                            fields: vec![Field::default()],
+                            ..Default::default()
+                        });
                     }
                 }
             }
@@ -263,10 +264,7 @@ impl App {
                         st.editor = Some(AccountEditor {
                             id: a.id,
                             site: a.site.clone(),
-                            email: a.email.clone(),
-                            region: a.region.clone(),
-                            payment_methods: a.payment_methods.clone(),
-                            notes: a.notes.clone(),
+                            fields: a.fields.clone(),
                         });
                     }
                 }
@@ -280,11 +278,25 @@ impl App {
                 }
             }
 
-            Message::EditSite(s) => edit_field(&mut self.screen, |e| e.site = s),
-            Message::EditEmail(s) => edit_field(&mut self.screen, |e| e.email = s),
-            Message::EditRegion(s) => edit_field(&mut self.screen, |e| e.region = s),
-            Message::EditPayment(s) => edit_field(&mut self.screen, |e| e.payment_methods = s),
-            Message::EditNotes(s) => edit_field(&mut self.screen, |e| e.notes = s),
+            Message::EditSite(s) => edit_editor(&mut self.screen, |e| e.site = s),
+            Message::EditFieldKey(idx, s) => edit_editor(&mut self.screen, |e| {
+                if let Some(f) = e.fields.get_mut(idx) {
+                    f.key = s;
+                }
+            }),
+            Message::EditFieldValue(idx, s) => edit_editor(&mut self.screen, |e| {
+                if let Some(f) = e.fields.get_mut(idx) {
+                    f.value = s;
+                }
+            }),
+            Message::AddField => edit_editor(&mut self.screen, |e| {
+                e.fields.push(Field::default());
+            }),
+            Message::RemoveField(idx) => edit_editor(&mut self.screen, |e| {
+                if idx < e.fields.len() {
+                    e.fields.remove(idx);
+                }
+            }),
             Message::EditSave => {
                 if let Screen::Main(st) = &mut self.screen {
                     if let (Some(gid), Some(e)) = (st.selected_group, &st.editor) {
@@ -292,10 +304,7 @@ impl App {
                             id: e.id,
                             group_id: gid,
                             site: e.site.clone(),
-                            email: e.email.clone(),
-                            region: e.region.clone(),
-                            payment_methods: e.payment_methods.clone(),
-                            notes: e.notes.clone(),
+                            fields: e.fields.clone(),
                         };
                         if !a.site.trim().is_empty() {
                             let _ = st.db.upsert_account(&a);
@@ -324,7 +333,7 @@ impl App {
     }
 }
 
-fn edit_field(screen: &mut Screen, f: impl FnOnce(&mut AccountEditor)) {
+fn edit_editor(screen: &mut Screen, f: impl FnOnce(&mut AccountEditor)) {
     if let Screen::Main(st) = screen {
         if let Some(e) = st.editor.as_mut() {
             f(e);
@@ -601,93 +610,121 @@ fn accounts_view<'a>(
             .iter()
             .filter(|a| {
                 a.site.to_lowercase().contains(&q)
-                    || a.email.to_lowercase().contains(&q)
-                    || a.region.to_lowercase().contains(&q)
-                    || a.payment_methods.to_lowercase().contains(&q)
-                    || a.notes.to_lowercase().contains(&q)
+                    || a.fields.iter().any(|f| {
+                        f.key.to_lowercase().contains(&q)
+                            || f.value.to_lowercase().contains(&q)
+                    })
             })
             .collect()
     };
 
-    let mut list = column![].spacing(10);
-    if !has_group {
-        list = list.push(text("Select or create a group."));
+    let body: Element<'a, Message> = if !has_group {
+        text("Select or create a group.").into()
     } else if accounts.is_empty() {
-        list = list.push(text("No accounts yet."));
+        text("No accounts yet.").into()
     } else if filtered.is_empty() {
-        list = list.push(text("No accounts match the search."));
+        text("No accounts match the search.").into()
     } else {
-        for a in filtered {
-            list = list.push(account_card(a));
+        accounts_table(&filtered)
+    };
+
+    column![header, search_bar, body].spacing(12).into()
+}
+
+fn accounts_table<'a>(accounts: &[&'a Account]) -> Element<'a, Message> {
+    let mut keys: Vec<String> = Vec::new();
+    for a in accounts {
+        for f in &a.fields {
+            let k = f.key.trim();
+            if !k.is_empty() && !keys.iter().any(|e| e == k) {
+                keys.push(k.to_string());
+            }
         }
     }
+    keys.sort();
 
-    column![header, search_bar, scrollable(list).height(Length::Fill)]
-        .spacing(12)
+    let site_w = Length::Fixed(180.0);
+    let field_w = Length::Fixed(160.0);
+    let actions_w = Length::Fixed(110.0);
+
+    let mut header_row = row![text("Site").size(14).width(site_w)].spacing(8);
+    for k in &keys {
+        header_row = header_row.push(text(k.clone()).size(14).width(field_w));
+    }
+    header_row = header_row.push(text("").width(actions_w));
+
+    let mut body_col = column![header_row, horizontal_rule(1)].spacing(4);
+
+    for a in accounts {
+        let mut r = row![text(a.site.clone()).size(13).width(site_w)].spacing(8);
+        for k in &keys {
+            let joined = a
+                .fields
+                .iter()
+                .filter(|f| f.key.trim() == k.as_str())
+                .map(|f| f.value.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            r = r.push(text(joined).size(13).width(field_w));
+        }
+        r = r.push(
+            row![
+                button(text("Edit").size(11)).on_press(Message::EditAccount(a.id)),
+                button(text("Del").size(11)).on_press(Message::DeleteAccount(a.id)),
+            ]
+            .spacing(4)
+            .width(actions_w),
+        );
+        body_col = body_col.push(r);
+    }
+
+    scrollable(body_col)
+        .direction(scrollable::Direction::Both {
+            vertical: scrollable::Scrollbar::default(),
+            horizontal: scrollable::Scrollbar::default(),
+        })
         .into()
-}
-
-fn account_card(a: &Account) -> Element<'_, Message> {
-    let title_row = row![
-        text(a.site.clone()).size(18),
-        horizontal_space(),
-        button(text("Edit").size(12)).on_press(Message::EditAccount(a.id)),
-        button(text("Delete").size(12)).on_press(Message::DeleteAccount(a.id)),
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center);
-
-    let fields = column![
-        field_row("Email", &a.email),
-        field_row("Region", &a.region),
-        field_row("Payment", &a.payment_methods),
-        field_row("Notes", &a.notes),
-    ]
-    .spacing(2);
-
-    container(column![title_row, fields].spacing(6))
-        .padding(10)
-        .style(container::rounded_box)
-        .into()
-}
-
-fn field_row(label: &str, value: &str) -> Element<'static, Message> {
-    row![
-        text(format!("{label}:"))
-            .width(Length::Fixed(90.0))
-            .size(13),
-        text(value.to_string()).size(13),
-    ]
-    .spacing(6)
-    .into()
 }
 
 fn editor_view(e: &AccountEditor) -> Element<'_, Message> {
     let title = if e.id == 0 { "New Account" } else { "Edit Account" };
-    column![
+
+    let mut col = column![
         text(title).size(22),
         text_input("Site (e.g. Netflix)", &e.site)
             .on_input(Message::EditSite)
             .padding(8),
-        text_input("Email", &e.email)
-            .on_input(Message::EditEmail)
-            .padding(8),
-        text_input("Region (e.g. US, JP)", &e.region)
-            .on_input(Message::EditRegion)
-            .padding(8),
-        text_input("Payment methods", &e.payment_methods)
-            .on_input(Message::EditPayment)
-            .padding(8),
-        text_input("Notes", &e.notes)
-            .on_input(Message::EditNotes)
-            .padding(8),
+        text("Fields").size(14),
+    ]
+    .spacing(10);
+
+    for (i, f) in e.fields.iter().enumerate() {
+        col = col.push(
+            row![
+                text_input("Key (e.g. email)", &f.key)
+                    .on_input(move |s| Message::EditFieldKey(i, s))
+                    .width(Length::FillPortion(2))
+                    .padding(6),
+                text_input("Value", &f.value)
+                    .on_input(move |s| Message::EditFieldValue(i, s))
+                    .width(Length::FillPortion(3))
+                    .padding(6),
+                button(text("x").size(12)).on_press(Message::RemoveField(i)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+    }
+
+    col = col.push(button(text("+ Add Field")).on_press(Message::AddField));
+
+    col = col.push(
         row![
             button(text("Save")).on_press(Message::EditSave),
             button(text("Cancel")).on_press(Message::EditCancel),
         ]
         .spacing(8),
-    ]
-    .spacing(10)
-    .max_width(560)
-    .into()
+    );
+
+    scrollable(col.max_width(600)).into()
 }

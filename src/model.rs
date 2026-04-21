@@ -5,12 +5,15 @@ pub struct Group {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct Field {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct Account {
     pub id: i64,
     pub group_id: i64,
     pub site: String,
-    pub email: String,
-    pub region: String,
-    pub payment_methods: String,
-    pub notes: String,
+    pub fields: Vec<Field>,
 }
