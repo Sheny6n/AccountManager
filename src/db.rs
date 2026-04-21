@@ -14,20 +14,22 @@ impl Db {
     pub fn open(path: &Path, key: Option<&[u8]>, salt: Option<&[u8]>) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
         if let Some(k) = key {
+            let mut hex = key_to_hex(k);
+            let pragma = format!("PRAGMA key = \"x'{}'\";", hex);
+            let result = conn.execute_batch(&pragma);
+            hex.zeroize();
+            result.map_err(|e| e.to_string())?;
+
             if let Some(s) = salt {
-                // cipher_salt must be set before or with the key so SQLCipher
-                // uses our Argon2 salt as the file salt (first 16 bytes).
+                // cipher_salt must be set AFTER key for SQLCipher to honor it
+                // when creating a new database. This pins the file's first 16
+                // bytes to our Argon2id salt, so re-opens can re-derive the key.
                 let mut salt_hex = key_to_hex(s);
                 let pragma = format!("PRAGMA cipher_salt = \"x'{}'\";", salt_hex);
                 let result = conn.execute_batch(&pragma);
                 salt_hex.zeroize();
                 result.map_err(|e| e.to_string())?;
             }
-            let mut hex = key_to_hex(k);
-            let pragma = format!("PRAGMA key = \"x'{}'\";", hex);
-            let result = conn.execute_batch(&pragma);
-            hex.zeroize();
-            result.map_err(|e| e.to_string())?;
         }
 
         // Trigger key verification: this fails if the key is wrong.
@@ -125,6 +127,13 @@ impl Db {
             .execute("INSERT INTO groups (name) VALUES (?1)", params![name])
             .map_err(|e| e.to_string())?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn rename_group(&self, id: i64, name: &str) -> Result<(), String> {
+        self.conn
+            .execute("UPDATE groups SET name = ?1 WHERE id = ?2", params![name, id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn delete_group(&self, id: i64) -> Result<(), String> {

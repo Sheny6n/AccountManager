@@ -57,6 +57,7 @@ struct MainState {
     search: String,
     editor: Option<AccountEditor>,
     error: Option<String>,
+    renaming_group: Option<(i64, String)>,
 }
 
 #[derive(Default)]
@@ -85,6 +86,10 @@ enum Message {
     NewGroupNameChanged(String),
     AddGroup,
     DeleteGroup(i64),
+    StartRenameGroup(i64),
+    RenameGroupChanged(String),
+    ConfirmRenameGroup,
+    CancelRenameGroup,
     SearchChanged(String),
 
     NewAccount,
@@ -247,6 +252,49 @@ impl App {
                         Some(gid) => st.db.list_accounts(gid).unwrap_or_default(),
                         None => vec![],
                     };
+                    if matches!(&st.renaming_group, Some((rid, _)) if *rid == id) {
+                        st.renaming_group = None;
+                    }
+                }
+            }
+            Message::StartRenameGroup(id) => {
+                if let Screen::Main(st) = &mut self.screen {
+                    if let Some(g) = st.groups.iter().find(|g| g.id == id) {
+                        st.renaming_group = Some((id, g.name.clone()));
+                        st.error = None;
+                    }
+                }
+            }
+            Message::RenameGroupChanged(s) => {
+                if let Screen::Main(st) = &mut self.screen {
+                    if let Some((_, name)) = st.renaming_group.as_mut() {
+                        *name = s;
+                    }
+                }
+            }
+            Message::ConfirmRenameGroup => {
+                if let Screen::Main(st) = &mut self.screen {
+                    if let Some((id, name)) = st.renaming_group.clone() {
+                        let trimmed = name.trim().to_string();
+                        if trimmed.is_empty() {
+                            st.error = Some("Group name is required".into());
+                            return Task::none();
+                        }
+                        match st.db.rename_group(id, &trimmed) {
+                            Ok(()) => {
+                                st.groups = st.db.list_groups().unwrap_or_default();
+                                st.renaming_group = None;
+                                st.error = None;
+                            }
+                            Err(err) => st.error = Some(format!("Rename failed: {err}")),
+                        }
+                    }
+                }
+            }
+            Message::CancelRenameGroup => {
+                if let Screen::Main(st) = &mut self.screen {
+                    st.renaming_group = None;
+                    st.error = None;
                 }
             }
 
@@ -474,6 +522,7 @@ fn enter_main(db_path: PathBuf, db: Db) -> MainState {
         search: String::new(),
         editor: None,
         error: None,
+        renaming_group: None,
     }
 }
 
@@ -620,6 +669,35 @@ fn main_view(st: &MainState) -> Element<'_, Message> {
     .spacing(4);
 
     for g in &st.groups {
+        let renaming = st
+            .renaming_group
+            .as_ref()
+            .filter(|(rid, _)| *rid == g.id)
+            .map(|(_, name)| name.as_str());
+
+        if let Some(current) = renaming {
+            groups_col = groups_col.push(
+                row![
+                    text_input("Name", current)
+                        .on_input(Message::RenameGroupChanged)
+                        .on_submit(Message::ConfirmRenameGroup)
+                        .padding(6)
+                        .size(13),
+                    button(text("✓").size(13))
+                        .padding([4, 8])
+                        .on_press(Message::ConfirmRenameGroup)
+                        .style(button::primary),
+                    button(text("×").size(13))
+                        .padding([4, 8])
+                        .on_press(Message::CancelRenameGroup)
+                        .style(button::secondary),
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center),
+            );
+            continue;
+        }
+
         let selected = st.selected_group == Some(g.id);
         let mut name_btn = button(text(g.name.clone()).size(14))
             .width(Length::Fill)
@@ -633,6 +711,10 @@ fn main_view(st: &MainState) -> Element<'_, Message> {
         groups_col = groups_col.push(
             row![
                 name_btn,
+                button(text("✎").size(12))
+                    .padding([4, 8])
+                    .on_press(Message::StartRenameGroup(g.id))
+                    .style(button::secondary),
                 button(text("×").size(14))
                     .padding([4, 8])
                     .on_press(Message::DeleteGroup(g.id))
