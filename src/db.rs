@@ -7,6 +7,7 @@ use zeroize::Zeroize;
 use crate::crypto::key_to_hex;
 use crate::model::{Account, Field, Group};
 
+
 pub struct Db {
     conn: Connection,
 }
@@ -71,49 +72,6 @@ impl Db {
                 );",
             )
             .map_err(|e| e.to_string())?;
-
-        // Ensure `pinned` exists on accounts tables created before it was added.
-        let _ = self
-            .conn
-            .execute("ALTER TABLE accounts ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0", []);
-
-        self.migrate_legacy_columns().map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    fn migrate_legacy_columns(&self) -> rusqlite::Result<()> {
-        let legacy = ["email", "region", "payment_methods", "notes"];
-        let present: Vec<&str> = legacy
-            .iter()
-            .copied()
-            .filter(|col| {
-                self.conn
-                    .query_row(
-                        "SELECT 1 FROM pragma_table_info('accounts') WHERE name = ?1",
-                        [col],
-                        |_| Ok(()),
-                    )
-                    .is_ok()
-            })
-            .collect();
-
-        if present.is_empty() {
-            return Ok(());
-        }
-
-        let tx = self.conn.unchecked_transaction()?;
-        for (i, col) in present.iter().enumerate() {
-            let sql = format!(
-                "INSERT INTO account_fields (account_id, position, key, value)
-                 SELECT id, ?1, ?2, {0} FROM accounts WHERE {0} <> ''",
-                col
-            );
-            tx.execute(&sql, params![i as i64, col])?;
-        }
-        for col in &present {
-            tx.execute(&format!("ALTER TABLE accounts DROP COLUMN {}", col), [])?;
-        }
-        tx.commit()?;
         Ok(())
     }
 

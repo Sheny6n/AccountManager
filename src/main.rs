@@ -1,4 +1,3 @@
-mod config;
 mod crypto;
 mod db;
 mod model;
@@ -12,10 +11,10 @@ use iced::widget::{
     button, column, container, horizontal_rule, horizontal_space, radio, row, scrollable, text,
     text_input, vertical_space,
 };
+use iced::widget::text_input::Id as TextInputId;
 use iced::{Alignment, Color, Element, Length, Subscription, Task, Theme};
 use zeroize::Zeroize;
 
-use config::{AppConfig, AutoLockTimeout};
 use crypto::SALT_LEN;
 use db::Db;
 use model::{Account, Field, Group};
@@ -26,6 +25,79 @@ fn main() -> iced::Result {
         .subscription(App::subscription)
         .window_size((1080.0, 720.0))
         .run_with(App::new)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoLockTimeout {
+    Never,
+    OneMin,
+    FiveMin,
+    FifteenMin,
+    ThirtyMin,
+    OneHour,
+}
+
+impl AutoLockTimeout {
+    const ALL: &'static [AutoLockTimeout] = &[
+        AutoLockTimeout::Never,
+        AutoLockTimeout::OneMin,
+        AutoLockTimeout::FiveMin,
+        AutoLockTimeout::FifteenMin,
+        AutoLockTimeout::ThirtyMin,
+        AutoLockTimeout::OneHour,
+    ];
+
+    fn seconds(self) -> Option<u64> {
+        match self {
+            AutoLockTimeout::Never => None,
+            AutoLockTimeout::OneMin => Some(60),
+            AutoLockTimeout::FiveMin => Some(300),
+            AutoLockTimeout::FifteenMin => Some(900),
+            AutoLockTimeout::ThirtyMin => Some(1800),
+            AutoLockTimeout::OneHour => Some(3600),
+        }
+    }
+
+    fn from_seconds(s: Option<u64>) -> Self {
+        match s {
+            None => AutoLockTimeout::Never,
+            Some(n) => AutoLockTimeout::ALL
+                .iter()
+                .copied()
+                .find(|t| t.seconds() == Some(n))
+                .unwrap_or(AutoLockTimeout::Never),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            AutoLockTimeout::Never => "Never",
+            AutoLockTimeout::OneMin => "1 minute",
+            AutoLockTimeout::FiveMin => "5 minutes",
+            AutoLockTimeout::FifteenMin => "15 minutes",
+            AutoLockTimeout::ThirtyMin => "30 minutes",
+            AutoLockTimeout::OneHour => "1 hour",
+        }
+    }
+
+    fn encode(self) -> String {
+        match self.seconds() {
+            None => "never".to_string(),
+            Some(n) => n.to_string(),
+        }
+    }
+
+    fn decode(s: &str) -> Self {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("never") || s.is_empty() {
+            AutoLockTimeout::Never
+        } else {
+            match s.parse::<u64>() {
+                Ok(n) => AutoLockTimeout::from_seconds(Some(n)),
+                Err(_) => AutoLockTimeout::Never,
+            }
+        }
+    }
 }
 
 fn app_theme() -> Theme {
@@ -45,8 +117,6 @@ struct App {
     tabs: Vec<Screen>,
     active_tab: usize,
     startup_error: Option<String>,
-    config: AppConfig,
-    last_activity: Instant,
 }
 
 enum Screen {
@@ -84,26 +154,67 @@ struct MainState {
     group_menu_open: Option<i64>,
     settings: Option<SettingsState>,
     site_width: f32,
-    actions_width: f32,
     field_widths: HashMap<String, f32>,
+    quick_add: Vec<String>,
+    auto_lock: AutoLockTimeout,
+    last_activity: Instant,
 }
 
 const DEFAULT_SITE_WIDTH: f32 = 200.0;
 const DEFAULT_FIELD_WIDTH: f32 = 180.0;
-const DEFAULT_ACTIONS_WIDTH: f32 = 180.0;
+const ACTIONS_WIDTH: f32 = 180.0;
 const COLUMN_STEP: f32 = 20.0;
 const MIN_COLUMN_WIDTH: f32 = 80.0;
 const MAX_COLUMN_WIDTH: f32 = 800.0;
 
 const PREF_COL_SITE: &str = "col.site";
-const PREF_COL_ACTIONS: &str = "col.actions";
 const PREF_COL_FIELD_PREFIX: &str = "col.field.";
+const PREF_QUICK_ADD: &str = "quick_add";
+const PREF_AUTO_LOCK: &str = "auto_lock_seconds";
+
+const DEFAULT_QUICK_ADD: &[&str] = &[
+    "email",
+    "username",
+    "region",
+    "phone",
+    "id",
+    "notes",
+];
+
+fn encode_quick_add(list: &[String]) -> String {
+    list.join("\n")
+}
+
+fn decode_quick_add(s: &str) -> Vec<String> {
+    s.split('\n')
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
 
 #[derive(Debug, Clone)]
 enum ColumnId {
     Site,
-    Actions,
     Field(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FocusFrom {
+    Site,
+    Key(usize),
+    Value(usize),
+}
+
+fn site_input_id() -> TextInputId {
+    TextInputId::new("edit-site")
+}
+
+fn key_input_id(i: usize) -> TextInputId {
+    TextInputId::new(format!("edit-key-{i}"))
+}
+
+fn value_input_id(i: usize) -> TextInputId {
+    TextInputId::new(format!("edit-val-{i}"))
 }
 
 #[derive(Default)]
@@ -112,6 +223,7 @@ struct SettingsState {
     confirm: String,
     error: Option<String>,
     success: Option<String>,
+    quick_add_input: String,
 }
 
 #[derive(Default)]
@@ -162,9 +274,11 @@ enum Message {
     EditFieldKey(usize, String),
     EditFieldValue(usize, String),
     AddField,
+    AddFieldWithKey(String),
     RemoveField(usize),
     EditSave,
     EditCancel,
+    EditFocusNext(FocusFrom),
 
     OpenSettings,
     CloseSettings,
@@ -172,6 +286,10 @@ enum Message {
     SettingsNewPasswordChanged(String),
     SettingsConfirmPasswordChanged(String),
     ChangePasswordSubmit,
+    QuickAddInputChanged(String),
+    AddQuickAddPreset,
+    RemoveQuickAddPreset(usize),
+    ResetQuickAddDefaults,
 
     Tick,
 }
@@ -183,15 +301,16 @@ impl App {
                 tabs: vec![Screen::Start],
                 active_tab: 0,
                 startup_error: None,
-                config: AppConfig::load(),
-                last_activity: Instant::now(),
             },
             Task::none(),
         )
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        if self.config.auto_lock.seconds().is_some() {
+        let any_timeout = self.tabs.iter().any(|s| {
+            matches!(s, Screen::Main(st) if st.auto_lock.seconds().is_some())
+        });
+        if any_timeout {
             iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick)
         } else {
             Subscription::none()
@@ -218,7 +337,9 @@ impl App {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         if !matches!(message, Message::Tick) {
-            self.last_activity = Instant::now();
+            if let Some(Screen::Main(st)) = self.tabs.get_mut(self.active_tab) {
+                st.last_activity = Instant::now();
+            }
         }
         match message {
             Message::NewTab => {
@@ -490,13 +611,6 @@ impl App {
                                 .clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH);
                             let _ = st.db.set_pref(PREF_COL_SITE, &st.site_width.to_string());
                         }
-                        ColumnId::Actions => {
-                            st.actions_width = (st.actions_width + d)
-                                .clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH);
-                            let _ = st
-                                .db
-                                .set_pref(PREF_COL_ACTIONS, &st.actions_width.to_string());
-                        }
                         ColumnId::Field(k) => {
                             let cur = *st
                                 .field_widths
@@ -524,6 +638,12 @@ impl App {
             }),
             Message::AddField => edit_editor(self.active_mut(), |e| {
                 e.fields.push(Field::default());
+            }),
+            Message::AddFieldWithKey(k) => edit_editor(self.active_mut(), |e| {
+                e.fields.push(Field {
+                    key: k,
+                    value: String::new(),
+                });
             }),
             Message::RemoveField(idx) => edit_editor(self.active_mut(), |e| {
                 if idx < e.fields.len() {
@@ -570,6 +690,33 @@ impl App {
                     st.error = None;
                 }
             }
+            Message::EditFocusNext(from) => {
+                if let Screen::Main(st) = self.active_mut() {
+                    if let Some(e) = st.editor.as_ref() {
+                        let next_id = match from {
+                            FocusFrom::Site => {
+                                if e.fields.is_empty() {
+                                    None
+                                } else {
+                                    Some(key_input_id(0))
+                                }
+                            }
+                            FocusFrom::Key(i) => Some(value_input_id(i)),
+                            FocusFrom::Value(i) => {
+                                if i + 1 < e.fields.len() {
+                                    Some(key_input_id(i + 1))
+                                } else {
+                                    None
+                                }
+                            }
+                        };
+                        return match next_id {
+                            Some(id) => text_input::focus(id),
+                            None => Task::done(Message::EditSave),
+                        };
+                    }
+                }
+            }
 
             Message::OpenSettings => {
                 if let Screen::Main(st) = self.active_mut() {
@@ -588,9 +735,11 @@ impl App {
                 }
             }
             Message::AutoLockChanged(t) => {
-                self.config.auto_lock = t;
-                let _ = self.config.save();
-                self.last_activity = Instant::now();
+                if let Screen::Main(st) = self.active_mut() {
+                    st.auto_lock = t;
+                    st.last_activity = Instant::now();
+                    let _ = st.db.set_pref(PREF_AUTO_LOCK, &t.encode());
+                }
             }
             Message::SettingsNewPasswordChanged(s) => {
                 if let Screen::Main(st) = self.active_mut() {
@@ -608,6 +757,53 @@ impl App {
                     }
                 }
             }
+            Message::QuickAddInputChanged(s) => {
+                if let Screen::Main(st) = self.active_mut() {
+                    if let Some(ss) = st.settings.as_mut() {
+                        ss.quick_add_input = s;
+                    }
+                }
+            }
+            Message::AddQuickAddPreset => {
+                if let Screen::Main(st) = self.active_mut() {
+                    let trimmed = st
+                        .settings
+                        .as_ref()
+                        .map(|ss| ss.quick_add_input.trim().to_string())
+                        .unwrap_or_default();
+                    if trimmed.is_empty() {
+                        return Task::none();
+                    }
+                    if !st.quick_add.iter().any(|p| p == &trimmed) {
+                        st.quick_add.push(trimmed);
+                        let _ = st
+                            .db
+                            .set_pref(PREF_QUICK_ADD, &encode_quick_add(&st.quick_add));
+                    }
+                    if let Some(ss) = st.settings.as_mut() {
+                        ss.quick_add_input.clear();
+                    }
+                }
+            }
+            Message::RemoveQuickAddPreset(idx) => {
+                if let Screen::Main(st) = self.active_mut() {
+                    if idx < st.quick_add.len() {
+                        st.quick_add.remove(idx);
+                        let _ = st
+                            .db
+                            .set_pref(PREF_QUICK_ADD, &encode_quick_add(&st.quick_add));
+                    }
+                }
+            }
+            Message::ResetQuickAddDefaults => {
+                if let Screen::Main(st) = self.active_mut() {
+                    st.quick_add = DEFAULT_QUICK_ADD.iter().map(|s| s.to_string()).collect();
+                    let _ = st
+                        .db
+                        .set_pref(PREF_QUICK_ADD, &encode_quick_add(&st.quick_add));
+                }
+            }
+
             Message::ChangePasswordSubmit => {
                 if let Screen::Main(st) = self.active_mut() {
                     if let Some(ss) = st.settings.as_mut() {
@@ -656,14 +852,13 @@ impl App {
             }
 
             Message::Tick => {
-                if let Some(secs) = self.config.auto_lock.seconds() {
-                    if self.last_activity.elapsed() >= Duration::from_secs(secs) {
-                        for s in &mut self.tabs {
-                            if matches!(s, Screen::Main(_)) {
+                for s in &mut self.tabs {
+                    if let Screen::Main(st) = s {
+                        if let Some(secs) = st.auto_lock.seconds() {
+                            if st.last_activity.elapsed() >= Duration::from_secs(secs) {
                                 *s = Screen::Start;
                             }
                         }
-                        self.last_activity = Instant::now();
                     }
                 }
             }
@@ -676,7 +871,7 @@ impl App {
             Screen::Start => start_view(self.startup_error.as_deref()),
             Screen::CreateProfile(st) => create_profile_view(st),
             Screen::Unlock(st) => unlock_view(st),
-            Screen::Main(st) => main_view(st, &self.config),
+            Screen::Main(st) => main_view(st),
         };
         column![tab_bar(&self.tabs, self.active_tab), body].into()
     }
@@ -857,10 +1052,6 @@ fn enter_main(db_path: PathBuf, db: Db, salt: Option<[u8; SALT_LEN]>) -> MainSta
         .get(PREF_COL_SITE)
         .and_then(parse_width)
         .unwrap_or(DEFAULT_SITE_WIDTH);
-    let actions_width = prefs
-        .get(PREF_COL_ACTIONS)
-        .and_then(parse_width)
-        .unwrap_or(DEFAULT_ACTIONS_WIDTH);
     let mut field_widths = HashMap::new();
     for (k, v) in &prefs {
         if let Some(field_key) = k.strip_prefix(PREF_COL_FIELD_PREFIX) {
@@ -869,6 +1060,16 @@ fn enter_main(db_path: PathBuf, db: Db, salt: Option<[u8; SALT_LEN]>) -> MainSta
             }
         }
     }
+
+    let quick_add = match prefs.get(PREF_QUICK_ADD) {
+        Some(s) => decode_quick_add(s),
+        None => DEFAULT_QUICK_ADD.iter().map(|s| s.to_string()).collect(),
+    };
+
+    let auto_lock = prefs
+        .get(PREF_AUTO_LOCK)
+        .map(|s| AutoLockTimeout::decode(s))
+        .unwrap_or(AutoLockTimeout::Never);
 
     MainState {
         db_path,
@@ -885,8 +1086,10 @@ fn enter_main(db_path: PathBuf, db: Db, salt: Option<[u8; SALT_LEN]>) -> MainSta
         group_menu_open: None,
         settings: None,
         site_width,
-        actions_width,
         field_widths,
+        quick_add,
+        auto_lock,
+        last_activity: Instant::now(),
     }
 }
 
@@ -1022,7 +1225,7 @@ fn unlock_view(st: &UnlockState) -> Element<'_, Message> {
         .into()
 }
 
-fn main_view<'a>(st: &'a MainState, config: &'a AppConfig) -> Element<'a, Message> {
+fn main_view(st: &MainState) -> Element<'_, Message> {
     let mut groups_col = column![
         text("GROUPS").size(11).color(MUTED),
         vertical_space().height(Length::Fixed(4.0)),
@@ -1130,9 +1333,9 @@ fn main_view<'a>(st: &'a MainState, config: &'a AppConfig) -> Element<'a, Messag
         .style(container::bordered_box);
 
     let body: Element<Message> = if let Some(ss) = &st.settings {
-        settings_view(ss, config, st.salt.is_some())
+        settings_view(ss, st.auto_lock, st.salt.is_some(), &st.quick_add)
     } else if let Some(editor) = &st.editor {
-        editor_view(editor, st.error.as_deref())
+        editor_view(editor, st.error.as_deref(), &st.quick_add)
     } else {
         accounts_view(st)
     };
@@ -1256,7 +1459,7 @@ fn accounts_table<'a>(st: &'a MainState, accounts: &[&'a Account]) -> Element<'a
     keys.sort();
 
     let site_len = Length::Fixed(st.site_width);
-    let actions_len = Length::Fixed(st.actions_width);
+    let actions_len = Length::Fixed(ACTIONS_WIDTH);
     let field_len = |k: &str| -> Length {
         Length::Fixed(
             *st.field_widths
@@ -1274,7 +1477,7 @@ fn accounts_table<'a>(st: &'a MainState, accounts: &[&'a Account]) -> Element<'a
             ColumnId::Field(k.clone()),
         ));
     }
-    header_row = header_row.push(header_cell(String::new(), actions_len, ColumnId::Actions));
+    header_row = header_row.push(container(text("")).width(actions_len));
 
     let mut body_col = column![container(header_row).padding([6, 10])].spacing(0);
 
@@ -1345,7 +1548,11 @@ fn empty_state(msg: &str) -> Element<'_, Message> {
         .into()
 }
 
-fn editor_view<'a>(e: &'a AccountEditor, error: Option<&'a str>) -> Element<'a, Message> {
+fn editor_view<'a>(
+    e: &'a AccountEditor,
+    error: Option<&'a str>,
+    presets: &'a [String],
+) -> Element<'a, Message> {
     let title = if e.id == 0 { "New Account" } else { "Edit Account" };
 
     let mut col = column![
@@ -1353,8 +1560,9 @@ fn editor_view<'a>(e: &'a AccountEditor, error: Option<&'a str>) -> Element<'a, 
         vertical_space().height(Length::Fixed(2.0)),
         text("SITE").size(11).color(MUTED),
         text_input("e.g. Netflix", &e.site)
+            .id(site_input_id())
             .on_input(Message::EditSite)
-            .on_submit(Message::EditSave)
+            .on_submit(Message::EditFocusNext(FocusFrom::Site))
             .padding(10)
             .size(14),
         vertical_space().height(Length::Fixed(6.0)),
@@ -1370,12 +1578,16 @@ fn editor_view<'a>(e: &'a AccountEditor, error: Option<&'a str>) -> Element<'a, 
         col = col.push(
             row![
                 text_input("Key (e.g. email)", &f.key)
+                    .id(key_input_id(i))
                     .on_input(move |s| Message::EditFieldKey(i, s))
+                    .on_submit(Message::EditFocusNext(FocusFrom::Key(i)))
                     .width(Length::FillPortion(2))
                     .padding(8)
                     .size(13),
                 text_input("Value", &f.value)
+                    .id(value_input_id(i))
                     .on_input(move |s| Message::EditFieldValue(i, s))
+                    .on_submit(Message::EditFocusNext(FocusFrom::Value(i)))
                     .width(Length::FillPortion(3))
                     .padding(8)
                     .size(13),
@@ -1386,6 +1598,25 @@ fn editor_view<'a>(e: &'a AccountEditor, error: Option<&'a str>) -> Element<'a, 
             ]
             .spacing(8)
             .align_y(Alignment::Center),
+        );
+    }
+
+    if !presets.is_empty() {
+        col = col.push(vertical_space().height(Length::Fixed(4.0)));
+        col = col.push(text("QUICK ADD").size(11).color(MUTED));
+        let mut chips = row![].spacing(6).align_y(Alignment::Center);
+        for preset in presets {
+            chips = chips.push(
+                button(text(preset.clone()).size(11))
+                    .padding([4, 10])
+                    .on_press(Message::AddFieldWithKey(preset.clone()))
+                    .style(button::secondary),
+            );
+        }
+        col = col.push(
+            scrollable(chips).direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::default(),
+            )),
         );
     }
 
@@ -1425,8 +1656,9 @@ fn editor_view<'a>(e: &'a AccountEditor, error: Option<&'a str>) -> Element<'a, 
 
 fn settings_view<'a>(
     ss: &'a SettingsState,
-    config: &'a AppConfig,
+    auto_lock: AutoLockTimeout,
     encrypted: bool,
+    quick_add: &'a [String],
 ) -> Element<'a, Message> {
     let mut col = column![
         text("Settings").size(26),
@@ -1440,7 +1672,7 @@ fn settings_view<'a>(
         col = col.push(radio(
             t.label(),
             *t,
-            Some(config.auto_lock),
+            Some(auto_lock),
             Message::AutoLockChanged,
         ));
     }
@@ -1483,6 +1715,54 @@ fn settings_view<'a>(
                 .color(MUTED),
         );
     }
+
+    col = col.push(vertical_space().height(Length::Fixed(14.0)));
+    col = col.push(horizontal_rule(1));
+    col = col.push(vertical_space().height(Length::Fixed(8.0)));
+    col = col.push(
+        row![
+            text("QUICK ADD PRESETS").size(11).color(MUTED),
+            horizontal_space(),
+            button(text("Reset to defaults").size(11))
+                .padding([4, 10])
+                .on_press(Message::ResetQuickAddDefaults)
+                .style(button::secondary),
+        ]
+        .align_y(Alignment::Center),
+    );
+
+    if quick_add.is_empty() {
+        col = col.push(text("No presets. Add one below.").size(12).color(MUTED));
+    } else {
+        for (i, preset) in quick_add.iter().enumerate() {
+            col = col.push(
+                row![
+                    text(preset.clone()).size(13).width(Length::Fill),
+                    button(text("Remove").size(11))
+                        .padding([4, 10])
+                        .on_press(Message::RemoveQuickAddPreset(i))
+                        .style(button::danger),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+        }
+    }
+
+    col = col.push(
+        row![
+            text_input("New preset (e.g. API key)", &ss.quick_add_input)
+                .on_input(Message::QuickAddInputChanged)
+                .on_submit(Message::AddQuickAddPreset)
+                .padding(8),
+            button(text("Add").size(13))
+                .padding([6, 14])
+                .on_press(Message::AddQuickAddPreset)
+                .style(button::primary),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    );
 
     col = col.push(vertical_space().height(Length::Fixed(14.0)));
     col = col.push(horizontal_rule(1));
