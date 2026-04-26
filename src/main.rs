@@ -162,7 +162,7 @@ struct MainState {
 
 const DEFAULT_SITE_WIDTH: f32 = 200.0;
 const DEFAULT_FIELD_WIDTH: f32 = 180.0;
-const ACTIONS_WIDTH: f32 = 180.0;
+const ACTIONS_WIDTH: f32 = 230.0;
 const COLUMN_STEP: f32 = 20.0;
 const MIN_COLUMN_WIDTH: f32 = 80.0;
 const MAX_COLUMN_WIDTH: f32 = 800.0;
@@ -266,6 +266,7 @@ enum Message {
     NewAccount,
     EditAccount(i64),
     DeleteAccount(i64),
+    DuplicateAccount(i64),
     TogglePin(i64),
 
     ResizeColumn(ColumnId, i32),
@@ -588,6 +589,24 @@ impl App {
                     let _ = st.db.delete_account(id);
                     if let Some(gid) = st.selected_group {
                         st.accounts = st.db.list_accounts(gid).unwrap_or_default();
+                    }
+                }
+            }
+            Message::DuplicateAccount(id) => {
+                if let Screen::Main(st) = self.active_mut() {
+                    if let Some(src) = st.accounts.iter().find(|a| a.id == id) {
+                        let copy = Account {
+                            id: 0,
+                            group_id: src.group_id,
+                            site: src.site.clone(),
+                            pinned: false,
+                            fields: src.fields.clone(),
+                        };
+                        if st.db.upsert_account(&copy).is_ok() {
+                            if let Some(gid) = st.selected_group {
+                                st.accounts = st.db.list_accounts(gid).unwrap_or_default();
+                            }
+                        }
                     }
                 }
             }
@@ -1514,6 +1533,10 @@ fn accounts_table<'a>(st: &'a MainState, accounts: &[&'a Account]) -> Element<'a
                 button(text("Edit").size(11))
                     .padding([4, 8])
                     .on_press(Message::EditAccount(a.id))
+                    .style(button::secondary),
+                button(text("Dup").size(11))
+                    .padding([4, 8])
+                    .on_press(Message::DuplicateAccount(a.id))
                     .style(button::secondary),
                 button(text("Del").size(11))
                     .padding([4, 8])
