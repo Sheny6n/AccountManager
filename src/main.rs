@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use iced::keyboard::{key::Named, Key, Modifiers};
 use iced::widget::text_input::Id as TextInputId;
 use iced::widget::{
-    button, checkbox, column, container, horizontal_rule, horizontal_space, radio, row, scrollable,
-    text, text_input, vertical_space,
+    button, checkbox, column, container, horizontal_rule, horizontal_space, mouse_area, radio, row,
+    scrollable, text, text_input, vertical_space,
 };
 use iced::{Alignment, Color, Element, Length, Subscription, Task, Theme};
 use zeroize::Zeroize;
@@ -160,20 +160,34 @@ struct MainState {
     group_menu_open: Option<i64>,
     settings: Option<SettingsState>,
     site_width: f32,
+    group_width: f32,
+    resize_drag: Option<(ColumnId, f32, f32)>,
+    cursor_x: f32,
     field_widths: HashMap<String, f32>,
     quick_add: Vec<String>,
     auto_lock: AutoLockTimeout,
     last_activity: Instant,
 }
 
+impl MainState {
+    fn column_width(&self, col: &ColumnId) -> f32 {
+        match col {
+            ColumnId::Site => self.site_width,
+            ColumnId::Group => self.group_width,
+            ColumnId::Field(key) => *self.field_widths.get(key).unwrap_or(&DEFAULT_FIELD_WIDTH),
+        }
+    }
+}
+
 const DEFAULT_SITE_WIDTH: f32 = 200.0;
 const DEFAULT_FIELD_WIDTH: f32 = 180.0;
 const ACTIONS_WIDTH: f32 = 230.0;
-const COLUMN_STEP: f32 = 20.0;
+const DEFAULT_GROUP_WIDTH: f32 = 150.0;
 const MIN_COLUMN_WIDTH: f32 = 80.0;
 const MAX_COLUMN_WIDTH: f32 = 800.0;
 
 const PREF_COL_SITE: &str = "col.site";
+const PREF_COL_GROUP: &str = "col.group";
 const PREF_COL_FIELD_PREFIX: &str = "col.field.";
 const PREF_QUICK_ADD: &str = "quick_add";
 const PREF_AUTO_LOCK: &str = "auto_lock_seconds";
@@ -191,9 +205,10 @@ fn decode_quick_add(s: &str) -> Vec<String> {
         .collect()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum ColumnId {
     Site,
+    Group,
     Field(String),
 }
 
@@ -292,7 +307,7 @@ enum Message {
     ToggleGroupMenu(i64),
     SearchChanged(String),
     ClearSearch,
-    GlobalSearch(bool),
+    SelectAllGroups,
     ShowTrash,
     RestoreItem(bool, i64),
 
@@ -302,7 +317,9 @@ enum Message {
     DuplicateAccount(i64),
     TogglePin(i64),
 
-    ResizeColumn(ColumnId, i32),
+    StartColumnResize(ColumnId),
+    ResizePointerMoved(f32),
+    FinishColumnResize,
 
     EditSite(String),
     EditFieldKey(usize, String),
@@ -588,7 +605,24 @@ impl App {
             Subscription::none()
         };
 
-        Subscription::batch([timer, iced::keyboard::on_key_press(key_pressed)])
+        Subscription::batch([
+            timer,
+            iced::keyboard::on_key_press(key_pressed),
+            // Include captured events so releasing outside the handle ends the drag.
+            iced::event::listen_with(|event, _, _| match event {
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                    Some(Message::ResizePointerMoved(position.x))
+                }
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                ))
+                | iced::Event::Mouse(iced::mouse::Event::CursorLeft)
+                | iced::Event::Window(iced::window::Event::Unfocused) => {
+                    Some(Message::FinishColumnResize)
+                }
+                _ => None,
+            }),
+        ])
     }
 
     fn active_mut(&mut self) -> &mut Screen {
@@ -839,9 +873,14 @@ impl App {
                     st.search.clear();
                 }
             }
-            Message::GlobalSearch(enabled) => {
+            Message::SelectAllGroups => {
                 if let Screen::Main(st) = self.active_mut() {
-                    st.global_search = enabled;
+                    st.global_search = true;
+                    st.show_trash = false;
+                    st.settings = None;
+                    st.editor = None;
+                    st.group_menu_open = None;
+                    st.search.clear();
                 }
             }
             Message::ShowTrash => {
@@ -1048,21 +1087,42 @@ impl App {
                     }
                 }
             }
-            Message::ResizeColumn(col, delta) => {
+            Message::StartColumnResize(col) => {
                 if let Screen::Main(st) = self.active_mut() {
-                    let d = delta as f32;
-                    match col {
-                        ColumnId::Site => {
-                            st.site_width =
-                                (st.site_width + d).clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH);
-                            let _ = st.db.set_pref(PREF_COL_SITE, &st.site_width.to_string());
+                    let width = st.column_width(&col);
+                    st.resize_drag = Some((col, st.cursor_x, width));
+                }
+            }
+            Message::ResizePointerMoved(x) => {
+                if let Screen::Main(st) = self.active_mut() {
+                    st.cursor_x = x;
+                    if let Some((col, origin, width)) = st.resize_drag.clone() {
+                        let width = (width + x - origin).clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH);
+                        match col {
+                            ColumnId::Site => st.site_width = width,
+                            ColumnId::Group => st.group_width = width,
+                            ColumnId::Field(key) => {
+                                st.field_widths.insert(key, width);
+                            }
                         }
-                        ColumnId::Field(k) => {
-                            let cur = *st.field_widths.get(&k).unwrap_or(&DEFAULT_FIELD_WIDTH);
-                            let new_w = (cur + d).clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH);
-                            st.field_widths.insert(k.clone(), new_w);
-                            let pref_key = format!("{PREF_COL_FIELD_PREFIX}{k}");
-                            let _ = st.db.set_pref(&pref_key, &new_w.to_string());
+                    }
+                }
+            }
+            Message::FinishColumnResize => {
+                // Save once on release, leaving pointer movement free of database writes.
+                for screen in &mut self.tabs {
+                    if let Screen::Main(st) = screen {
+                        if let Some((col, _, _)) = st.resize_drag.take() {
+                            let key = match &col {
+                                ColumnId::Site => PREF_COL_SITE.to_string(),
+                                ColumnId::Group => PREF_COL_GROUP.to_string(),
+                                ColumnId::Field(key) => format!("{PREF_COL_FIELD_PREFIX}{key}"),
+                            };
+                            if let Err(err) =
+                                st.db.set_pref(&key, &st.column_width(&col).to_string())
+                            {
+                                st.error = Some(format!("Save column width failed: {err}"));
+                            }
                         }
                     }
                 }
@@ -1639,6 +1699,12 @@ fn enter_main(db_path: PathBuf, db: Db, salt: Option<[u8; SALT_LEN]>) -> MainSta
         group_menu_open: None,
         settings: None,
         site_width,
+        group_width: prefs
+            .get(PREF_COL_GROUP)
+            .and_then(parse_width)
+            .unwrap_or(DEFAULT_GROUP_WIDTH),
+        resize_drag: None,
+        cursor_x: 0.0,
         field_widths,
         quick_add,
         auto_lock,
@@ -1785,6 +1851,15 @@ fn main_view<'a>(st: &'a MainState, shortcuts: &ShortcutSettings) -> Element<'a,
     let mut groups_col = column![
         text("GROUPS").size(11).color(MUTED),
         vertical_space().height(Length::Fixed(4.0)),
+        button(text("All groups").size(14))
+            .width(Length::Fill)
+            .padding([6, 10])
+            .on_press(Message::SelectAllGroups)
+            .style(if st.global_search && !st.show_trash {
+                button::primary
+            } else {
+                button::text
+            }),
     ]
     .spacing(4);
 
@@ -2014,7 +2089,6 @@ fn accounts_view<'a>(st: &'a MainState, shortcuts: &ShortcutSettings) -> Element
         .size(14);
     let search_controls = row![
         search_bar,
-        checkbox("All groups", st.global_search).on_toggle(Message::GlobalSearch),
         text(result_count).size(12).color(MUTED),
         button(text("Clear").size(12))
             .padding([7, 12])
@@ -2094,31 +2168,39 @@ fn trash_view(st: &MainState) -> Element<'_, Message> {
     content.push(scrollable(items).height(Length::Fill)).into()
 }
 
-fn resize_buttons(col: ColumnId) -> Element<'static, Message> {
-    row![
-        button(text("−").size(10))
-            .padding([1, 5])
-            .on_press(Message::ResizeColumn(col.clone(), -(COLUMN_STEP as i32)))
-            .style(button::secondary),
-        button(text("+").size(10))
-            .padding([1, 5])
-            .on_press(Message::ResizeColumn(col, COLUMN_STEP as i32))
-            .style(button::secondary),
-    ]
-    .spacing(2)
-    .align_y(Alignment::Center)
-    .into()
-}
-
-fn header_cell(label: String, width: Length, col: ColumnId) -> Element<'static, Message> {
-    container(
-        row![
-            text(label).size(12).color(MUTED).width(Length::Fill),
-            resize_buttons(col),
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center),
+fn header_cell(
+    label: String,
+    width: Length,
+    col: ColumnId,
+    active: bool,
+) -> Element<'static, Message> {
+    let divider = container(horizontal_space())
+        .width(Length::Fixed(2.0))
+        .height(Length::Fixed(24.0))
+        .style(move |_| container::Style {
+            background: Some(
+                if active {
+                    Color::from_rgb8(80, 180, 255)
+                } else {
+                    Color::from_rgb8(110, 110, 125)
+                }
+                .into(),
+            ),
+            ..Default::default()
+        });
+    let handle = mouse_area(
+        container(divider)
+            .width(Length::Fixed(12.0))
+            .center_x(Length::Fixed(12.0)),
     )
+    .interaction(iced::mouse::Interaction::ResizingHorizontally)
+    .on_press(Message::StartColumnResize(col));
+
+    row![
+        text(label).size(12).color(MUTED).width(Length::Fill),
+        handle,
+    ]
+    .align_y(Alignment::Center)
     .width(width)
     .into()
 }
@@ -2141,21 +2223,32 @@ fn accounts_table<'a>(st: &'a MainState, accounts: &[&'a Account]) -> Element<'a
         Length::Fixed(*st.field_widths.get(k).unwrap_or(&DEFAULT_FIELD_WIDTH))
     };
 
-    let mut header_row =
-        row![header_cell("Site".to_string(), site_len, ColumnId::Site)].spacing(10);
+    let is_resizing = |col: &ColumnId| {
+        st.resize_drag
+            .as_ref()
+            .is_some_and(|(active, _, _)| active == col)
+    };
+    let mut header_row = row![header_cell(
+        "Site".to_string(),
+        site_len,
+        ColumnId::Site,
+        is_resizing(&ColumnId::Site)
+    )]
+    .spacing(10);
     if st.global_search {
-        header_row = header_row.push(
-            text("Group")
-                .size(12)
-                .color(MUTED)
-                .width(Length::Fixed(150.0)),
-        );
+        header_row = header_row.push(header_cell(
+            "Group".to_string(),
+            Length::Fixed(st.group_width),
+            ColumnId::Group,
+            is_resizing(&ColumnId::Group),
+        ));
     }
     for k in &keys {
         header_row = header_row.push(header_cell(
             k.clone(),
             field_len(k),
             ColumnId::Field(k.clone()),
+            is_resizing(&ColumnId::Field(k.clone())),
         ));
     }
     header_row = header_row.push(container(text("")).width(actions_len));
@@ -2182,7 +2275,7 @@ fn accounts_table<'a>(st: &'a MainState, accounts: &[&'a Account]) -> Element<'a
                 button(text(group_name).size(13))
                     .on_press(Message::SelectGroup(a.group_id))
                     .style(button::text)
-                    .width(Length::Fixed(150.0)),
+                    .width(Length::Fixed(st.group_width)),
             );
         }
         for k in &keys {
@@ -2646,6 +2739,56 @@ mod tests {
 #[cfg(test)]
 mod feature_tests {
     use super::*;
+
+    #[test]
+    fn dragging_columns_clamps_and_persists_only_on_release() {
+        let db = Db::open(Path::new(":memory:"), None, None).unwrap();
+        db.init_schema().unwrap();
+        let state = enter_main(PathBuf::from("test.am"), db, None);
+        let mut app = App {
+            tabs: vec![Screen::Main(state)],
+            active_tab: 0,
+            startup_error: None,
+            shortcuts: ShortcutSettings::default(),
+        };
+        for (col, key, distance, expected) in [
+            (
+                ColumnId::Site,
+                PREF_COL_SITE,
+                120.0,
+                DEFAULT_SITE_WIDTH + 120.0,
+            ),
+            (ColumnId::Group, PREF_COL_GROUP, -500.0, MIN_COLUMN_WIDTH),
+            (
+                ColumnId::Field("email".into()),
+                "col.field.email",
+                2000.0,
+                MAX_COLUMN_WIDTH,
+            ),
+        ] {
+            let _ = app.update(Message::ResizePointerMoved(300.0));
+            let _ = app.update(Message::StartColumnResize(col.clone()));
+            let _ = app.update(Message::ResizePointerMoved(300.0 + distance));
+            if let Screen::Main(st) = app.active_mut() {
+                assert_eq!(st.column_width(&col), expected);
+                assert!(!st.db.load_prefs().unwrap().contains_key(key));
+            }
+            let _ = app.update(Message::FinishColumnResize);
+            let _ = app.update(Message::ResizePointerMoved(900.0));
+            if let Screen::Main(st) = app.active_mut() {
+                assert!(st.resize_drag.is_none());
+                assert_eq!(st.column_width(&col), expected);
+                assert_eq!(st.db.load_prefs().unwrap()[key], expected.to_string());
+            }
+        }
+        let Screen::Main(st) = app.tabs.remove(0) else {
+            panic!("expected main");
+        };
+        let reopened = enter_main(st.db_path, st.db, None);
+        assert_eq!(reopened.site_width, DEFAULT_SITE_WIDTH + 120.0);
+        assert_eq!(reopened.group_width, MIN_COLUMN_WIDTH);
+        assert_eq!(reopened.field_widths["email"], MAX_COLUMN_WIDTH);
+    }
 
     #[test]
     fn editing_global_result_keeps_original_group_and_trash_restores_it() {
