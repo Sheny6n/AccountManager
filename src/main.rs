@@ -3,14 +3,16 @@ mod db;
 mod model;
 
 use std::collections::HashMap;
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use iced::keyboard::{key::Named, Key, Modifiers};
 use iced::widget::text_input::Id as TextInputId;
 use iced::widget::{
-    button, column, container, horizontal_rule, horizontal_space, radio, row, scrollable, text,
-    text_input, vertical_space,
+    button, checkbox, column, container, horizontal_rule, horizontal_space, radio, row, scrollable,
+    text, text_input, vertical_space,
 };
 use iced::{Alignment, Color, Element, Length, Subscription, Task, Theme};
 use zeroize::Zeroize;
@@ -117,6 +119,7 @@ struct App {
     tabs: Vec<Screen>,
     active_tab: usize,
     startup_error: Option<String>,
+    shortcuts: ShortcutSettings,
 }
 
 enum Screen {
@@ -210,13 +213,40 @@ fn value_input_id(i: usize) -> TextInputId {
     TextInputId::new(format!("edit-val-{i}"))
 }
 
-#[derive(Default)]
+fn search_input_id() -> TextInputId {
+    TextInputId::new("account-search")
+}
+
 struct SettingsState {
+    section: SettingsSection,
     new_password: String,
     confirm: String,
     error: Option<String>,
     success: Option<String>,
     quick_add_input: String,
+    shortcut_inputs: ShortcutSettings,
+    shortcut_error: Option<String>,
+}
+
+impl SettingsState {
+    fn new(shortcuts: &ShortcutSettings) -> Self {
+        Self {
+            section: SettingsSection::App,
+            new_password: String::new(),
+            confirm: String::new(),
+            error: None,
+            success: None,
+            quick_add_input: String::new(),
+            shortcut_inputs: shortcuts.clone(),
+            shortcut_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsSection {
+    App,
+    Profile,
 }
 
 #[derive(Default)]
@@ -228,6 +258,9 @@ struct AccountEditor {
 
 #[derive(Debug, Clone)]
 enum Message {
+    KeyPressed(Key, Modifiers),
+    Shortcut(Shortcut),
+
     NewTab,
     SelectTab(usize),
     CloseTab(usize),
@@ -255,6 +288,7 @@ enum Message {
     CancelRenameGroup,
     ToggleGroupMenu(i64),
     SearchChanged(String),
+    ClearSearch,
 
     NewAccount,
     EditAccount(i64),
@@ -276,6 +310,7 @@ enum Message {
 
     OpenSettings,
     CloseSettings,
+    SelectSettingsSection(SettingsSection),
     AutoLockChanged(AutoLockTimeout),
     SettingsNewPasswordChanged(String),
     SettingsConfirmPasswordChanged(String),
@@ -284,8 +319,243 @@ enum Message {
     AddQuickAddPreset,
     RemoveQuickAddPreset(usize),
     ResetQuickAddDefaults,
+    ShortcutChanged(ShortcutAction, String),
+    ShortcutsEnabledChanged(bool),
+    ResetShortcuts,
 
     Tick,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Shortcut {
+    NewAccount,
+    FocusSearch,
+    FocusNext,
+    Dismiss,
+    Save,
+    Lock,
+    Settings,
+    NewTab,
+    CloseTab,
+    SelectTab(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortcutAction {
+    NewAccount,
+    FocusSearch,
+    Save,
+    Lock,
+    Settings,
+    NewTab,
+    CloseTab,
+}
+
+impl ShortcutAction {
+    const ALL: &'static [ShortcutAction] = &[
+        ShortcutAction::NewAccount,
+        ShortcutAction::FocusSearch,
+        ShortcutAction::Save,
+        ShortcutAction::Lock,
+        ShortcutAction::Settings,
+        ShortcutAction::NewTab,
+        ShortcutAction::CloseTab,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            ShortcutAction::NewAccount => "New account",
+            ShortcutAction::FocusSearch => "Focus search",
+            ShortcutAction::Save => "Save account",
+            ShortcutAction::Lock => "Lock profile",
+            ShortcutAction::Settings => "Open settings",
+            ShortcutAction::NewTab => "New tab",
+            ShortcutAction::CloseTab => "Close tab",
+        }
+    }
+
+    fn config_key(self) -> &'static str {
+        match self {
+            ShortcutAction::NewAccount => "new_account",
+            ShortcutAction::FocusSearch => "focus_search",
+            ShortcutAction::Save => "save",
+            ShortcutAction::Lock => "lock",
+            ShortcutAction::Settings => "settings",
+            ShortcutAction::NewTab => "new_tab",
+            ShortcutAction::CloseTab => "close_tab",
+        }
+    }
+
+    fn shortcut(self) -> Shortcut {
+        match self {
+            ShortcutAction::NewAccount => Shortcut::NewAccount,
+            ShortcutAction::FocusSearch => Shortcut::FocusSearch,
+            ShortcutAction::Save => Shortcut::Save,
+            ShortcutAction::Lock => Shortcut::Lock,
+            ShortcutAction::Settings => Shortcut::Settings,
+            ShortcutAction::NewTab => Shortcut::NewTab,
+            ShortcutAction::CloseTab => Shortcut::CloseTab,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ShortcutSettings {
+    enabled: bool,
+    new_account: String,
+    focus_search: String,
+    save: String,
+    lock: String,
+    settings: String,
+    new_tab: String,
+    close_tab: String,
+}
+
+impl Default for ShortcutSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            new_account: "n".into(),
+            focus_search: "f".into(),
+            save: "s".into(),
+            lock: "l".into(),
+            settings: ",".into(),
+            new_tab: "t".into(),
+            close_tab: "w".into(),
+        }
+    }
+}
+
+impl ShortcutSettings {
+    fn get(&self, action: ShortcutAction) -> &str {
+        match action {
+            ShortcutAction::NewAccount => &self.new_account,
+            ShortcutAction::FocusSearch => &self.focus_search,
+            ShortcutAction::Save => &self.save,
+            ShortcutAction::Lock => &self.lock,
+            ShortcutAction::Settings => &self.settings,
+            ShortcutAction::NewTab => &self.new_tab,
+            ShortcutAction::CloseTab => &self.close_tab,
+        }
+    }
+
+    fn set(&mut self, action: ShortcutAction, value: String) {
+        match action {
+            ShortcutAction::NewAccount => self.new_account = value,
+            ShortcutAction::FocusSearch => self.focus_search = value,
+            ShortcutAction::Save => self.save = value,
+            ShortcutAction::Lock => self.lock = value,
+            ShortcutAction::Settings => self.settings = value,
+            ShortcutAction::NewTab => self.new_tab = value,
+            ShortcutAction::CloseTab => self.close_tab = value,
+        }
+    }
+
+    fn action_for_key(&self, key: &str) -> Option<ShortcutAction> {
+        ShortcutAction::ALL
+            .iter()
+            .copied()
+            .find(|action| self.get(*action).eq_ignore_ascii_case(key))
+    }
+
+    fn load() -> Self {
+        let mut settings = Self::default();
+        let Ok(contents) = fs::read_to_string(app_settings_path()) else {
+            return settings;
+        };
+
+        for line in contents.lines() {
+            let Some((name, value)) = line.split_once('=') else {
+                continue;
+            };
+            if name == "enabled" {
+                settings.enabled = value != "false";
+                continue;
+            }
+            if !valid_shortcut_key(value) {
+                continue;
+            }
+            if let Some(action) = ShortcutAction::ALL
+                .iter()
+                .copied()
+                .find(|action| action.config_key() == name)
+            {
+                settings.set(action, value.to_string());
+            }
+        }
+
+        settings
+    }
+
+    fn save(&self) -> Result<(), String> {
+        let path = app_settings_path();
+        let parent = path
+            .parent()
+            .ok_or_else(|| "invalid app settings path".to_string())?;
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+
+        let shortcuts = ShortcutAction::ALL
+            .iter()
+            .map(|action| format!("{}={}", action.config_key(), self.get(*action)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let contents = format!("enabled={}\n{shortcuts}", self.enabled);
+        fs::write(path, format!("{contents}\n")).map_err(|e| e.to_string())
+    }
+}
+
+fn shortcut_hint(label: &str, settings: &ShortcutSettings, action: ShortcutAction) -> String {
+    if settings.enabled {
+        format!("{label}  [{}]", settings.get(action).to_uppercase())
+    } else {
+        label.to_string()
+    }
+}
+
+fn app_settings_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("Account Manager")
+            .join("settings.conf");
+    }
+
+    if let Some(config) = std::env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(config)
+            .join("account-manager")
+            .join("settings.conf");
+    }
+
+    PathBuf::from("account-manager-settings.conf")
+}
+
+fn valid_shortcut_key(value: &str) -> bool {
+    value.chars().count() == 1
+        && !value.chars().next().is_some_and(char::is_whitespace)
+        && !matches!(value, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+}
+
+fn key_pressed(key: Key, modifiers: Modifiers) -> Option<Message> {
+    Some(Message::KeyPressed(key, modifiers))
+}
+
+fn fixed_shortcut(key: &Key) -> Option<Shortcut> {
+    match key.as_ref() {
+        Key::Named(Named::Escape) => Some(Shortcut::Dismiss),
+        Key::Named(Named::Tab) => Some(Shortcut::FocusNext),
+        Key::Character("1") => Some(Shortcut::SelectTab(0)),
+        Key::Character("2") => Some(Shortcut::SelectTab(1)),
+        Key::Character("3") => Some(Shortcut::SelectTab(2)),
+        Key::Character("4") => Some(Shortcut::SelectTab(3)),
+        Key::Character("5") => Some(Shortcut::SelectTab(4)),
+        Key::Character("6") => Some(Shortcut::SelectTab(5)),
+        Key::Character("7") => Some(Shortcut::SelectTab(6)),
+        Key::Character("8") => Some(Shortcut::SelectTab(7)),
+        Key::Character("9") => Some(Shortcut::SelectTab(8)),
+        _ => None,
+    }
 }
 
 impl App {
@@ -295,6 +565,7 @@ impl App {
                 tabs: vec![Screen::Start],
                 active_tab: 0,
                 startup_error: None,
+                shortcuts: ShortcutSettings::load(),
             },
             Task::none(),
         )
@@ -305,11 +576,13 @@ impl App {
             .tabs
             .iter()
             .any(|s| matches!(s, Screen::Main(st) if st.auto_lock.seconds().is_some()));
-        if any_timeout {
+        let timer = if any_timeout {
             iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick)
         } else {
             Subscription::none()
-        }
+        };
+
+        Subscription::batch([timer, iced::keyboard::on_key_press(key_pressed)])
     }
 
     fn active_mut(&mut self) -> &mut Screen {
@@ -337,6 +610,96 @@ impl App {
             }
         }
         match message {
+            Message::KeyPressed(key, modifiers) => {
+                if !modifiers.is_empty() {
+                    return Task::none();
+                }
+
+                let fixed = fixed_shortcut(&key);
+                let shortcut = match fixed {
+                    Some(Shortcut::Dismiss | Shortcut::FocusNext) => fixed,
+                    Some(_) if self.shortcuts.enabled => fixed,
+                    _ if self.shortcuts.enabled => match key.as_ref() {
+                        Key::Character(key) => self
+                            .shortcuts
+                            .action_for_key(key)
+                            .map(ShortcutAction::shortcut),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(shortcut) = shortcut {
+                    return Task::done(Message::Shortcut(shortcut));
+                }
+            }
+            Message::Shortcut(shortcut) => match shortcut {
+                Shortcut::NewAccount => {
+                    if matches!(
+                        self.tabs.get(self.active_tab),
+                        Some(Screen::Main(st))
+                            if st.editor.is_none()
+                                && st.settings.is_none()
+                                && st.selected_group.is_some()
+                    ) {
+                        return Task::done(Message::NewAccount);
+                    }
+                }
+                Shortcut::FocusSearch => {
+                    if matches!(
+                        self.tabs.get(self.active_tab),
+                        Some(Screen::Main(st)) if st.editor.is_none() && st.settings.is_none()
+                    ) {
+                        return text_input::focus(search_input_id());
+                    }
+                }
+                Shortcut::FocusNext => return iced::widget::focus_next(),
+                Shortcut::Dismiss => match self.tabs.get(self.active_tab) {
+                    Some(Screen::CreateProfile(_)) => return Task::done(Message::CreateCancel),
+                    Some(Screen::Unlock(_)) => return Task::done(Message::UnlockCancel),
+                    Some(Screen::Main(st)) if st.group_menu_open.is_some() => {
+                        let id = st.group_menu_open.expect("checked above");
+                        return Task::done(Message::ToggleGroupMenu(id));
+                    }
+                    Some(Screen::Main(st)) if st.renaming_group.is_some() => {
+                        return Task::done(Message::CancelRenameGroup);
+                    }
+                    Some(Screen::Main(st)) if st.settings.is_some() => {
+                        return Task::done(Message::CloseSettings);
+                    }
+                    Some(Screen::Main(st)) if st.editor.is_some() => {
+                        return Task::done(Message::EditCancel);
+                    }
+                    _ => {}
+                },
+                Shortcut::Save => {
+                    if matches!(
+                        self.tabs.get(self.active_tab),
+                        Some(Screen::Main(st)) if st.editor.is_some()
+                    ) {
+                        return Task::done(Message::EditSave);
+                    }
+                }
+                Shortcut::Lock => {
+                    if matches!(self.tabs.get(self.active_tab), Some(Screen::Main(_))) {
+                        return Task::done(Message::LockProfile);
+                    }
+                }
+                Shortcut::Settings => {
+                    if matches!(
+                        self.tabs.get(self.active_tab),
+                        Some(Screen::Main(st)) if st.settings.is_none()
+                    ) {
+                        return Task::done(Message::OpenSettings);
+                    }
+                }
+                Shortcut::NewTab => return Task::done(Message::NewTab),
+                Shortcut::CloseTab => return Task::done(Message::CloseTab(self.active_tab)),
+                Shortcut::SelectTab(index) => {
+                    if index < self.tabs.len() {
+                        return Task::done(Message::SelectTab(index));
+                    }
+                }
+            },
             Message::NewTab => {
                 self.tabs.push(Screen::Start);
                 self.active_tab = self.tabs.len() - 1;
@@ -470,6 +833,12 @@ impl App {
             Message::SearchChanged(s) => {
                 if let Screen::Main(st) = self.active_mut() {
                     st.search = s;
+                }
+            }
+            Message::ClearSearch => {
+                if let Screen::Main(st) = self.active_mut() {
+                    st.search.clear();
+                    return text_input::focus(search_input_id());
                 }
             }
             Message::NewGroupNameChanged(s) => {
@@ -729,8 +1098,9 @@ impl App {
             }
 
             Message::OpenSettings => {
+                let shortcuts = self.shortcuts.clone();
                 if let Screen::Main(st) = self.active_mut() {
-                    st.settings = Some(SettingsState::default());
+                    st.settings = Some(SettingsState::new(&shortcuts));
                     st.editor = None;
                     st.error = None;
                 }
@@ -742,6 +1112,13 @@ impl App {
                         ss.confirm.zeroize();
                     }
                     st.settings = None;
+                }
+            }
+            Message::SelectSettingsSection(section) => {
+                if let Screen::Main(st) = self.active_mut() {
+                    if let Some(ss) = st.settings.as_mut() {
+                        ss.section = section;
+                    }
                 }
             }
             Message::AutoLockChanged(t) => {
@@ -813,6 +1190,87 @@ impl App {
                         .set_pref(PREF_QUICK_ADD, &encode_quick_add(&st.quick_add));
                 }
             }
+            Message::ShortcutChanged(action, value) => {
+                let value = if value.chars().count() > 1 {
+                    value
+                        .chars()
+                        .last()
+                        .map(|c| c.to_string())
+                        .unwrap_or_default()
+                } else {
+                    value
+                };
+
+                if let Screen::Main(st) = self.active_mut() {
+                    if let Some(ss) = st.settings.as_mut() {
+                        ss.shortcut_inputs.set(action, value.clone());
+                        ss.shortcut_error = None;
+                    }
+                }
+
+                let error = if !valid_shortcut_key(&value) {
+                    Some("Use one non-space character; 1–9 are reserved for tabs.".to_string())
+                } else if ShortcutAction::ALL.iter().copied().any(|other| {
+                    other != action && self.shortcuts.get(other).eq_ignore_ascii_case(&value)
+                }) {
+                    Some(format!("{value} is already assigned to another action."))
+                } else {
+                    None
+                };
+
+                if let Some(error) = error {
+                    if let Screen::Main(st) = self.active_mut() {
+                        if let Some(ss) = st.settings.as_mut() {
+                            ss.shortcut_error = Some(error);
+                        }
+                    }
+                    return Task::none();
+                }
+
+                self.shortcuts.set(action, value);
+                let save_error = self
+                    .shortcuts
+                    .save()
+                    .err()
+                    .map(|e| format!("Save failed: {e}"));
+                let shortcuts = self.shortcuts.clone();
+                if let Screen::Main(st) = self.active_mut() {
+                    if let Some(ss) = st.settings.as_mut() {
+                        ss.shortcut_inputs = shortcuts;
+                        ss.shortcut_error = save_error;
+                    }
+                }
+            }
+            Message::ShortcutsEnabledChanged(enabled) => {
+                self.shortcuts.enabled = enabled;
+                let save_error = self
+                    .shortcuts
+                    .save()
+                    .err()
+                    .map(|e| format!("Save failed: {e}"));
+                let shortcuts = self.shortcuts.clone();
+                if let Screen::Main(st) = self.active_mut() {
+                    if let Some(ss) = st.settings.as_mut() {
+                        ss.shortcut_inputs = shortcuts;
+                        ss.shortcut_error = save_error;
+                    }
+                }
+            }
+            Message::ResetShortcuts => {
+                self.shortcuts = ShortcutSettings::default();
+                let save_error = self
+                    .shortcuts
+                    .save()
+                    .err()
+                    .map(|e| format!("Save failed: {e}"));
+                let shortcuts = self.shortcuts.clone();
+                if let Screen::Main(st) = self.active_mut() {
+                    if let Some(ss) = st.settings.as_mut() {
+                        ss.shortcut_inputs = shortcuts;
+                        ss.shortcut_error = save_error;
+                    }
+                }
+            }
 
             Message::ChangePasswordSubmit => {
                 if let Screen::Main(st) = self.active_mut() {
@@ -881,9 +1339,9 @@ impl App {
             Screen::Start => start_view(self.startup_error.as_deref()),
             Screen::CreateProfile(st) => create_profile_view(st),
             Screen::Unlock(st) => unlock_view(st),
-            Screen::Main(st) => main_view(st),
+            Screen::Main(st) => main_view(st, &self.shortcuts),
         };
-        column![tab_bar(&self.tabs, self.active_tab), body].into()
+        column![tab_bar(&self.tabs, self.active_tab, &self.shortcuts), body].into()
     }
 }
 
@@ -896,7 +1354,11 @@ fn tab_label(s: &Screen) -> String {
     }
 }
 
-fn tab_bar<'a>(tabs: &'a [Screen], active: usize) -> Element<'a, Message> {
+fn tab_bar<'a>(
+    tabs: &'a [Screen],
+    active: usize,
+    shortcuts: &ShortcutSettings,
+) -> Element<'a, Message> {
     let mut bar = row![].spacing(4).align_y(Alignment::Center);
     for (i, s) in tabs.iter().enumerate() {
         let is_active = i == active;
@@ -908,10 +1370,15 @@ fn tab_bar<'a>(tabs: &'a [Screen], active: usize) -> Element<'a, Message> {
         } else {
             label_btn.style(button::secondary)
         };
+        let close_label = if is_active {
+            shortcut_hint("×", shortcuts, ShortcutAction::CloseTab)
+        } else {
+            "×".to_string()
+        };
         bar = bar.push(
             row![
                 label_btn,
-                button(text("×").size(12))
+                button(text(close_label).size(12))
                     .padding([4, 8])
                     .on_press(Message::CloseTab(i))
                     .style(button::secondary),
@@ -921,10 +1388,17 @@ fn tab_bar<'a>(tabs: &'a [Screen], active: usize) -> Element<'a, Message> {
         );
     }
     bar = bar.push(
-        button(text("+ New Tab").size(12))
-            .padding([6, 12])
-            .on_press(Message::NewTab)
-            .style(button::secondary),
+        button(
+            text(shortcut_hint(
+                "+ New Tab",
+                shortcuts,
+                ShortcutAction::NewTab,
+            ))
+            .size(12),
+        )
+        .padding([6, 12])
+        .on_press(Message::NewTab)
+        .style(button::secondary),
     );
     container(scrollable(bar).direction(scrollable::Direction::Horizontal(
         scrollable::Scrollbar::default(),
@@ -1238,7 +1712,7 @@ fn unlock_view(st: &UnlockState) -> Element<'_, Message> {
         .into()
 }
 
-fn main_view(st: &MainState) -> Element<'_, Message> {
+fn main_view<'a>(st: &'a MainState, shortcuts: &ShortcutSettings) -> Element<'a, Message> {
     let mut groups_col = column![
         text("GROUPS").size(11).color(MUTED),
         vertical_space().height(Length::Fixed(4.0)),
@@ -1348,20 +1822,27 @@ fn main_view(st: &MainState) -> Element<'_, Message> {
     let body: Element<Message> = if let Some(ss) = &st.settings {
         settings_view(ss, st.auto_lock, st.salt.is_some(), &st.quick_add)
     } else if let Some(editor) = &st.editor {
-        editor_view(editor, st.error.as_deref(), &st.quick_add)
+        editor_view(editor, st.error.as_deref(), &st.quick_add, shortcuts)
     } else {
-        accounts_view(st)
+        accounts_view(st, shortcuts)
     };
 
     let header = container(
         row![
             text(format!("Profile: {}", display_name(&st.db_path))).size(18),
             horizontal_space(),
-            button(text("Settings").size(13))
-                .padding([6, 14])
-                .on_press(Message::OpenSettings)
-                .style(button::secondary),
-            button(text("Lock").size(13))
+            button(
+                text(shortcut_hint(
+                    "Settings",
+                    shortcuts,
+                    ShortcutAction::Settings
+                ))
+                .size(13)
+            )
+            .padding([6, 14])
+            .on_press(Message::OpenSettings)
+            .style(button::secondary),
+            button(text(shortcut_hint("Lock", shortcuts, ShortcutAction::Lock)).size(13))
                 .padding([6, 14])
                 .on_press(Message::LockProfile)
                 .style(button::secondary),
@@ -1385,20 +1866,27 @@ fn main_view(st: &MainState) -> Element<'_, Message> {
     .into()
 }
 
-fn accounts_view(st: &MainState) -> Element<'_, Message> {
+fn accounts_view<'a>(st: &'a MainState, shortcuts: &ShortcutSettings) -> Element<'a, Message> {
     let has_group = st.selected_group.is_some();
-    let add_btn = button(text("+ Add Account").size(13))
-        .padding([8, 14])
-        .on_press_maybe(has_group.then_some(Message::NewAccount))
-        .style(button::primary);
+    let add_btn = button(
+        text(shortcut_hint(
+            "+ Add Account",
+            shortcuts,
+            ShortcutAction::NewAccount,
+        ))
+        .size(13),
+    )
+    .padding([8, 14])
+    .on_press_maybe(has_group.then_some(Message::NewAccount))
+    .style(button::primary);
 
-    let header =
-        row![text("Accounts").size(22), horizontal_space(), add_btn].align_y(Alignment::Center);
-
-    let search_bar = text_input("Search accounts…", &st.search)
-        .on_input(Message::SearchChanged)
-        .padding(10)
-        .size(14);
+    let total = st.accounts.len();
+    let header = row![
+        text(format!("Accounts · {total}")).size(22),
+        horizontal_space(),
+        add_btn
+    ]
+    .align_y(Alignment::Center);
 
     let q = st.search.trim().to_lowercase();
     let filtered: Vec<&Account> = if q.is_empty() {
@@ -1415,6 +1903,29 @@ fn accounts_view(st: &MainState) -> Element<'_, Message> {
             .collect()
     };
 
+    let result_count = if q.is_empty() {
+        format!("{total} total")
+    } else {
+        format!("{} of {total}", filtered.len())
+    };
+    let search_placeholder =
+        shortcut_hint("Search accounts…", shortcuts, ShortcutAction::FocusSearch);
+    let search_bar = text_input(&search_placeholder, &st.search)
+        .id(search_input_id())
+        .on_input(Message::SearchChanged)
+        .padding(10)
+        .size(14);
+    let search_controls = row![
+        search_bar,
+        text(result_count).size(12).color(MUTED),
+        button(text("Clear").size(12))
+            .padding([7, 12])
+            .on_press_maybe((!q.is_empty()).then_some(Message::ClearSearch))
+            .style(button::secondary),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+
     let body: Element<Message> = if !has_group {
         empty_state("Select or create a group to get started.")
     } else if st.accounts.is_empty() {
@@ -1425,7 +1936,7 @@ fn accounts_view(st: &MainState) -> Element<'_, Message> {
         accounts_table(st, &filtered)
     };
 
-    column![header, search_bar, body].spacing(14).into()
+    column![header, search_controls, body].spacing(14).into()
 }
 
 fn resize_buttons(col: ColumnId) -> Element<'static, Message> {
@@ -1563,6 +2074,7 @@ fn editor_view<'a>(
     e: &'a AccountEditor,
     error: Option<&'a str>,
     presets: &'a [String],
+    shortcuts: &ShortcutSettings,
 ) -> Element<'a, Message> {
     let title = if e.id == 0 {
         "New Account"
@@ -1646,7 +2158,7 @@ fn editor_view<'a>(
     col = col.push(horizontal_rule(1));
     col = col.push(
         row![
-            button(text("Save").size(14))
+            button(text(shortcut_hint("Save", shortcuts, ShortcutAction::Save)).size(14))
                 .padding([8, 20])
                 .on_press(Message::EditSave)
                 .style(button::primary),
@@ -1675,7 +2187,38 @@ fn settings_view<'a>(
     encrypted: bool,
     quick_add: &'a [String],
 ) -> Element<'a, Message> {
-    let mut col = column![
+    let nav_button = |label: &'static str, section: SettingsSection| {
+        let control = button(text(label).size(14))
+            .width(Length::Fill)
+            .padding([9, 12])
+            .on_press(Message::SelectSettingsSection(section));
+        if ss.section == section {
+            control.style(button::primary)
+        } else {
+            control.style(button::text)
+        }
+    };
+
+    let navigation = container(
+        column![
+            text("CATEGORIES").size(11).color(MUTED),
+            vertical_space().height(Length::Fixed(4.0)),
+            nav_button("App", SettingsSection::App),
+            nav_button("Profile", SettingsSection::Profile),
+        ]
+        .spacing(4),
+    )
+    .width(Length::Fixed(160.0))
+    .height(Length::Fill)
+    .padding(12)
+    .style(container::bordered_box);
+
+    let content = match ss.section {
+        SettingsSection::App => app_settings_view(ss),
+        SettingsSection::Profile => profile_settings_view(ss, auto_lock, encrypted, quick_add),
+    };
+
+    column![
         row![
             text("Settings").size(26),
             horizontal_space(),
@@ -1685,6 +2228,77 @@ fn settings_view<'a>(
                 .style(button::secondary),
         ]
         .align_y(Alignment::Center),
+        horizontal_rule(1),
+        row![navigation, content].spacing(16).height(Length::Fill),
+    ]
+    .spacing(12)
+    .height(Length::Fill)
+    .into()
+}
+
+fn app_settings_view(ss: &SettingsState) -> Element<'_, Message> {
+    let mut col = column![
+        text("App").size(22),
+        text("Settings shared by every profile on this device.")
+            .size(12)
+            .color(MUTED),
+        vertical_space().height(Length::Fixed(8.0)),
+        text("KEYBOARD SHORTCUTS").size(11).color(MUTED),
+        text("Shortcuts are global and save automatically. Tab, Esc, and 1–9 are fixed.")
+            .size(12)
+            .color(MUTED),
+        checkbox("Enable keyboard shortcuts", ss.shortcut_inputs.enabled)
+            .on_toggle(Message::ShortcutsEnabledChanged),
+        vertical_space().height(Length::Fixed(2.0)),
+    ]
+    .spacing(6);
+
+    for action in ShortcutAction::ALL {
+        col = col.push(
+            row![
+                text(action.label()).size(13).width(Length::Fill),
+                text_input("Key", ss.shortcut_inputs.get(*action))
+                    .on_input(move |value| Message::ShortcutChanged(*action, value))
+                    .width(Length::Fixed(80.0))
+                    .padding(8),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center),
+        );
+    }
+
+    if let Some(error) = &ss.shortcut_error {
+        col = col.push(error_text(error));
+    }
+    col = col.push(
+        button(text("Restore shortcut defaults").size(12))
+            .padding([6, 12])
+            .on_press(Message::ResetShortcuts)
+            .style(button::secondary),
+    );
+
+    let card = container(col.max_width(620))
+        .padding(24)
+        .width(Length::Fill)
+        .style(container::rounded_box);
+
+    scrollable(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+fn profile_settings_view<'a>(
+    ss: &'a SettingsState,
+    auto_lock: AutoLockTimeout,
+    encrypted: bool,
+    quick_add: &'a [String],
+) -> Element<'a, Message> {
+    let mut col = column![
+        text("Profile").size(22),
+        text("Settings stored with the currently open profile.")
+            .size(12)
+            .color(MUTED),
         vertical_space().height(Length::Fixed(8.0)),
         text("AUTO-LOCK ON IDLE").size(11).color(MUTED),
         vertical_space().height(Length::Fixed(2.0)),
@@ -1790,7 +2404,7 @@ fn settings_view<'a>(
     col = col.push(vertical_space().height(Length::Fixed(14.0)));
     col = col.push(horizontal_rule(1));
 
-    let card = container(col.max_width(560))
+    let card = container(col.max_width(620))
         .padding(24)
         .width(Length::Fill)
         .style(container::rounded_box);
@@ -1826,4 +2440,28 @@ const SUCCESS: Color = Color {
 
 fn error_text(msg: &str) -> Element<'_, Message> {
     text(msg.to_string()).size(13).color(DANGER).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_shortcuts_are_valid_and_unique() {
+        let settings = ShortcutSettings::default();
+        for (index, action) in ShortcutAction::ALL.iter().enumerate() {
+            let key = settings.get(*action);
+            assert!(valid_shortcut_key(key));
+            assert!(ShortcutAction::ALL[index + 1..]
+                .iter()
+                .all(|other| !settings.get(*other).eq_ignore_ascii_case(key)));
+        }
+    }
+
+    #[test]
+    fn tab_selection_keys_are_reserved() {
+        for key in '1'..='9' {
+            assert!(!valid_shortcut_key(&key.to_string()));
+        }
+    }
 }
