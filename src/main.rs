@@ -151,6 +151,9 @@ struct MainState {
     accounts: Vec<Account>,
     new_group_name: String,
     search: String,
+    global_search: bool,
+    show_trash: bool,
+    trash_items: Vec<(bool, i64, String)>,
     editor: Option<AccountEditor>,
     error: Option<String>,
     renaming_group: Option<(i64, String)>,
@@ -289,6 +292,9 @@ enum Message {
     ToggleGroupMenu(i64),
     SearchChanged(String),
     ClearSearch,
+    GlobalSearch(bool),
+    ShowTrash,
+    RestoreItem(bool, i64),
 
     NewAccount,
     EditAccount(i64),
@@ -823,11 +829,52 @@ impl App {
             Message::LockProfile => *self.active_mut() = Screen::Start,
             Message::SelectGroup(id) => {
                 if let Screen::Main(st) = self.active_mut() {
+                    st.show_trash = false;
+                    st.settings = None;
+                    st.global_search = false;
                     st.selected_group = Some(id);
-                    st.accounts = st.db.list_accounts(id).unwrap_or_default();
+                    st.accounts = st.db.list_accounts().unwrap_or_default();
                     st.editor = None;
                     st.group_menu_open = None;
                     st.search.clear();
+                }
+            }
+            Message::GlobalSearch(enabled) => {
+                if let Screen::Main(st) = self.active_mut() {
+                    st.global_search = enabled;
+                }
+            }
+            Message::ShowTrash => {
+                if let Screen::Main(st) = self.active_mut() {
+                    st.show_trash = !st.show_trash;
+                    st.editor = None;
+                    st.settings = None;
+                    match st.db.trash_items() {
+                        Ok(items) => {
+                            st.trash_items = items;
+                            st.error = None;
+                        }
+                        Err(err) => st.error = Some(err),
+                    }
+                }
+            }
+            Message::RestoreItem(group, id) => {
+                if let Screen::Main(st) = self.active_mut() {
+                    match st.db.restore(group, id) {
+                        Ok(()) => {
+                            let result = (|| {
+                                st.groups = st.db.list_groups()?;
+                                st.accounts = st.db.list_accounts()?;
+                                st.trash_items = st.db.trash_items()?;
+                                Ok::<(), String>(())
+                            })();
+                            st.error = result.err();
+                            if st.selected_group.is_none() {
+                                st.selected_group = st.groups.first().map(|g| g.id);
+                            }
+                        }
+                        Err(err) => st.error = Some(format!("Restore failed: {err}")),
+                    }
                 }
             }
             Message::SearchChanged(s) => {
@@ -849,7 +896,14 @@ impl App {
             Message::AddGroup => {
                 if let Screen::Main(st) = self.active_mut() {
                     let name = st.new_group_name.trim().to_string();
-                    if !name.is_empty() && st.db.add_group(&name).is_ok() {
+                    if !name.is_empty() {
+                        if let Err(err) = st.db.add_group(&name) {
+                            st.error = Some(format!(
+                                "Create group failed (names in Recycle Bin are reserved): {err}"
+                            ));
+                            return Task::none();
+                        }
+                        st.error = None;
                         st.groups = st.db.list_groups().unwrap_or_default();
                         st.new_group_name.clear();
                         if st.selected_group.is_none() {
@@ -860,15 +914,21 @@ impl App {
             }
             Message::DeleteGroup(id) => {
                 if let Screen::Main(st) = self.active_mut() {
-                    let _ = st.db.delete_group(id);
+                    if let Err(err) = st.db.delete_group(id) {
+                        st.error = Some(format!("Move to trash failed: {err}"));
+                        return Task::none();
+                    }
+                    st.editor = None;
+                    st.error = None;
                     st.groups = st.db.list_groups().unwrap_or_default();
                     if st.selected_group == Some(id) {
                         st.selected_group = st.groups.first().map(|g| g.id);
                     }
-                    st.accounts = match st.selected_group {
-                        Some(gid) => st.db.list_accounts(gid).unwrap_or_default(),
-                        None => vec![],
-                    };
+                    st.accounts = st.db.list_accounts().unwrap_or_default();
+                    match st.db.trash_items() {
+                        Ok(items) => st.trash_items = items,
+                        Err(err) => st.error = Some(err),
+                    }
                     if matches!(&st.renaming_group, Some((rid, _)) if *rid == id) {
                         st.renaming_group = None;
                     }
@@ -928,7 +988,7 @@ impl App {
 
             Message::NewAccount => {
                 if let Screen::Main(st) = self.active_mut() {
-                    if st.selected_group.is_some() {
+                    if st.selected_group.is_some() && !st.show_trash {
                         st.editor = Some(AccountEditor {
                             fields: vec![Field::default()],
                             ..Default::default()
@@ -949,9 +1009,13 @@ impl App {
             }
             Message::DeleteAccount(id) => {
                 if let Screen::Main(st) = self.active_mut() {
-                    let _ = st.db.delete_account(id);
-                    if let Some(gid) = st.selected_group {
-                        st.accounts = st.db.list_accounts(gid).unwrap_or_default();
+                    if let Err(err) = st.db.delete_account(id) {
+                        st.error = Some(format!("Move to trash failed: {err}"));
+                        return Task::none();
+                    }
+                    st.error = None;
+                    if st.selected_group.is_some() {
+                        st.accounts = st.db.list_accounts().unwrap_or_default();
                     }
                 }
             }
@@ -966,8 +1030,8 @@ impl App {
                             fields: src.fields.clone(),
                         };
                         if st.db.upsert_account(&copy).is_ok() {
-                            if let Some(gid) = st.selected_group {
-                                st.accounts = st.db.list_accounts(gid).unwrap_or_default();
+                            if st.selected_group.is_some() {
+                                st.accounts = st.db.list_accounts().unwrap_or_default();
                             }
                         }
                     }
@@ -978,8 +1042,8 @@ impl App {
                     if let Some(a) = st.accounts.iter().find(|a| a.id == id) {
                         let new_state = !a.pinned;
                         let _ = st.db.set_pinned(id, new_state);
-                        if let Some(gid) = st.selected_group {
-                            st.accounts = st.db.list_accounts(gid).unwrap_or_default();
+                        if st.selected_group.is_some() {
+                            st.accounts = st.db.list_accounts().unwrap_or_default();
                         }
                     }
                 }
@@ -1044,13 +1108,18 @@ impl App {
                             .unwrap_or(false);
                         let a = Account {
                             id: e.id,
-                            group_id: gid,
+                            group_id: st
+                                .accounts
+                                .iter()
+                                .find(|a| a.id == e.id)
+                                .map(|a| a.group_id)
+                                .unwrap_or(gid),
                             site: e.site.clone(),
                             pinned: prev_pinned,
                             fields: e.fields.clone(),
                         };
                         match st.db.upsert_account(&a) {
-                            Ok(_) => match st.db.list_accounts(gid) {
+                            Ok(_) => match st.db.list_accounts() {
                                 Ok(list) => {
                                     st.accounts = list;
                                     st.editor = None;
@@ -1525,10 +1594,7 @@ fn open_profile(path: &Path, password: &str) -> Result<(Db, Option<[u8; SALT_LEN
 fn enter_main(db_path: PathBuf, db: Db, salt: Option<[u8; SALT_LEN]>) -> MainState {
     let groups = db.list_groups().unwrap_or_default();
     let selected_group = groups.first().map(|g| g.id);
-    let accounts = match selected_group {
-        Some(gid) => db.list_accounts(gid).unwrap_or_default(),
-        None => vec![],
-    };
+    let accounts = db.list_accounts().unwrap_or_default();
 
     let prefs = db.load_prefs().unwrap_or_default();
     let parse_width = |v: &String| v.parse::<f32>().ok();
@@ -1564,6 +1630,9 @@ fn enter_main(db_path: PathBuf, db: Db, salt: Option<[u8; SALT_LEN]>) -> MainSta
         accounts,
         new_group_name: String::new(),
         search: String::new(),
+        global_search: true,
+        show_trash: false,
+        trash_items: Vec::new(),
         editor: None,
         error: None,
         renaming_group: None,
@@ -1749,7 +1818,7 @@ fn main_view<'a>(st: &'a MainState, shortcuts: &ShortcutSettings) -> Element<'a,
             continue;
         }
 
-        let selected = st.selected_group == Some(g.id);
+        let selected = !st.show_trash && !st.global_search && st.selected_group == Some(g.id);
         let mut name_btn = button(text(g.name.clone()).size(14))
             .width(Length::Fill)
             .padding([6, 10])
@@ -1762,7 +1831,7 @@ fn main_view<'a>(st: &'a MainState, shortcuts: &ShortcutSettings) -> Element<'a,
         let menu_open = st.group_menu_open == Some(g.id);
         let actions: Element<Message> = if menu_open {
             row![
-                button(text("Delete").size(11))
+                button(text("Trash").size(11))
                     .padding([4, 8])
                     .on_press(Message::DeleteGroup(g.id))
                     .style(button::danger),
@@ -1813,6 +1882,18 @@ fn main_view<'a>(st: &'a MainState, shortcuts: &ShortcutSettings) -> Element<'a,
         .align_y(Alignment::Center),
     );
 
+    groups_col = groups_col.push(
+        button(text("Recycle Bin").size(14))
+            .on_press(Message::ShowTrash)
+            .padding([8, 10])
+            .width(Length::Fill)
+            .style(if st.show_trash {
+                button::primary
+            } else {
+                button::secondary
+            }),
+    );
+
     let sidebar = container(scrollable(groups_col).height(Length::Fill))
         .width(Length::Fixed(240.0))
         .height(Length::Fill)
@@ -1823,6 +1904,8 @@ fn main_view<'a>(st: &'a MainState, shortcuts: &ShortcutSettings) -> Element<'a,
         settings_view(ss, st.auto_lock, st.salt.is_some(), &st.quick_add)
     } else if let Some(editor) = &st.editor {
         editor_view(editor, st.error.as_deref(), &st.quick_add, shortcuts)
+    } else if st.show_trash {
+        trash_view(st)
     } else {
         accounts_view(st, shortcuts)
     };
@@ -1880,9 +1963,22 @@ fn accounts_view<'a>(st: &'a MainState, shortcuts: &ShortcutSettings) -> Element
     .on_press_maybe(has_group.then_some(Message::NewAccount))
     .style(button::primary);
 
-    let total = st.accounts.len();
+    let scoped: Vec<&Account> = st
+        .accounts
+        .iter()
+        .filter(|a| st.global_search || Some(a.group_id) == st.selected_group)
+        .collect();
+    let total = scoped.len();
     let header = row![
-        text(format!("Accounts · {total}")).size(22),
+        text(format!(
+            "{} · {total}",
+            if st.global_search {
+                "All Accounts"
+            } else {
+                "Accounts"
+            }
+        ))
+        .size(22),
         horizontal_space(),
         add_btn
     ]
@@ -1890,10 +1986,11 @@ fn accounts_view<'a>(st: &'a MainState, shortcuts: &ShortcutSettings) -> Element
 
     let q = st.search.trim().to_lowercase();
     let filtered: Vec<&Account> = if q.is_empty() {
-        st.accounts.iter().collect()
+        scoped.clone()
     } else {
-        st.accounts
+        scoped
             .iter()
+            .copied()
             .filter(|a| {
                 a.site.to_lowercase().contains(&q)
                     || a.fields.iter().any(|f| {
@@ -1917,6 +2014,7 @@ fn accounts_view<'a>(st: &'a MainState, shortcuts: &ShortcutSettings) -> Element
         .size(14);
     let search_controls = row![
         search_bar,
+        checkbox("All groups", st.global_search).on_toggle(Message::GlobalSearch),
         text(result_count).size(12).color(MUTED),
         button(text("Clear").size(12))
             .padding([7, 12])
@@ -1926,9 +2024,9 @@ fn accounts_view<'a>(st: &'a MainState, shortcuts: &ShortcutSettings) -> Element
     .spacing(10)
     .align_y(Alignment::Center);
 
-    let body: Element<Message> = if !has_group {
+    let body: Element<Message> = if !has_group && !st.global_search {
         empty_state("Select or create a group to get started.")
-    } else if st.accounts.is_empty() {
+    } else if scoped.is_empty() {
         empty_state("No accounts yet. Click \"+ Add Account\" to create one.")
     } else if filtered.is_empty() {
         empty_state("No accounts match your search.")
@@ -1936,7 +2034,64 @@ fn accounts_view<'a>(st: &'a MainState, shortcuts: &ShortcutSettings) -> Element
         accounts_table(st, &filtered)
     };
 
-    column![header, search_controls, body].spacing(14).into()
+    let mut content = column![header, search_controls].spacing(14);
+    if st.global_search {
+        if let Some(group) = st.groups.iter().find(|g| Some(g.id) == st.selected_group) {
+            content = content.push(
+                text(format!("New accounts will be added to: {}", group.name))
+                    .size(12)
+                    .color(MUTED),
+            );
+        }
+    }
+    if let Some(err) = &st.error {
+        content = content.push(text(err).color(DANGER));
+    }
+    content.push(body).into()
+}
+
+fn trash_view(st: &MainState) -> Element<'_, Message> {
+    let mut content = column![
+        row![
+            text("Recycle Bin").size(22),
+            horizontal_space(),
+            button("Back to accounts").on_press(Message::ShowTrash)
+        ],
+        text("Restore a group with its accounts, or restore an individual account.")
+            .size(13)
+            .color(MUTED),
+        text("Deleted group names stay reserved until restored and renamed.")
+            .size(12)
+            .color(MUTED),
+    ]
+    .spacing(14);
+    if let Some(err) = &st.error {
+        content = content.push(text(err).color(DANGER));
+    }
+    if st.trash_items.is_empty() {
+        content = content.push(text("Recycle Bin is empty."));
+    }
+    let mut items = column![].spacing(8);
+    for (group, id, name) in &st.trash_items {
+        items = items.push(
+            container(
+                row![
+                    text(format!(
+                        "{}: {}",
+                        if *group { "Group" } else { "Account" },
+                        name
+                    ))
+                    .width(Length::Fill),
+                    button("Restore").on_press(Message::RestoreItem(*group, *id))
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+            )
+            .padding(10)
+            .style(container::bordered_box),
+        );
+    }
+    content.push(scrollable(items).height(Length::Fill)).into()
 }
 
 fn resize_buttons(col: ColumnId) -> Element<'static, Message> {
@@ -1988,6 +2143,14 @@ fn accounts_table<'a>(st: &'a MainState, accounts: &[&'a Account]) -> Element<'a
 
     let mut header_row =
         row![header_cell("Site".to_string(), site_len, ColumnId::Site)].spacing(10);
+    if st.global_search {
+        header_row = header_row.push(
+            text("Group")
+                .size(12)
+                .color(MUTED)
+                .width(Length::Fixed(150.0)),
+        );
+    }
     for k in &keys {
         header_row = header_row.push(header_cell(
             k.clone(),
@@ -2008,6 +2171,20 @@ fn accounts_table<'a>(st: &'a MainState, accounts: &[&'a Account]) -> Element<'a
         let mut r = row![text(site_label).size(13).width(site_len)]
             .spacing(10)
             .align_y(Alignment::Center);
+        if st.global_search {
+            let group_name = st
+                .groups
+                .iter()
+                .find(|g| g.id == a.group_id)
+                .map(|g| g.name.as_str())
+                .unwrap_or("");
+            r = r.push(
+                button(text(group_name).size(13))
+                    .on_press(Message::SelectGroup(a.group_id))
+                    .style(button::text)
+                    .width(Length::Fixed(150.0)),
+            );
+        }
         for k in &keys {
             let joined = a
                 .fields
@@ -2037,7 +2214,7 @@ fn accounts_table<'a>(st: &'a MainState, accounts: &[&'a Account]) -> Element<'a
                     .padding([4, 8])
                     .on_press(Message::DuplicateAccount(a.id))
                     .style(button::secondary),
-                button(text("Del").size(11))
+                button(text("Trash").size(11))
                     .padding([4, 8])
                     .on_press(Message::DeleteAccount(a.id))
                     .style(button::danger),
@@ -2462,6 +2639,65 @@ mod tests {
     fn tab_selection_keys_are_reserved() {
         for key in '1'..='9' {
             assert!(!valid_shortcut_key(&key.to_string()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod feature_tests {
+    use super::*;
+
+    #[test]
+    fn editing_global_result_keeps_original_group_and_trash_restores_it() {
+        let db = Db::open(Path::new(":memory:"), None, None).unwrap();
+        db.init_schema().unwrap();
+        let first_group = db.add_group("A").unwrap();
+        let second_group = db.add_group("B").unwrap();
+        let id = db
+            .upsert_account(&Account {
+                group_id: second_group,
+                site: "Other group account".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let st = enter_main(PathBuf::from("test.am"), db, None);
+        assert_eq!(st.selected_group, Some(first_group));
+        assert!(st.global_search);
+        assert_eq!(st.accounts.len(), 1);
+        let mut app = App {
+            tabs: vec![Screen::Main(st)],
+            active_tab: 0,
+            startup_error: None,
+            shortcuts: ShortcutSettings::default(),
+        };
+        let _ = app.update(Message::SearchChanged("other".into()));
+        let _ = app.update(Message::EditAccount(id));
+        let _ = app.update(Message::EditSite("Updated".into()));
+        let _ = app.update(Message::EditSave);
+        if let Screen::Main(st) = app.active_mut() {
+            assert!(st.editor.is_none());
+            assert_eq!(st.accounts[0].site, "Updated");
+            assert_eq!(st.accounts[0].group_id, second_group);
+            assert_eq!(st.search, "other");
+        } else {
+            panic!("expected main screen");
+        }
+        let _ = app.update(Message::DeleteAccount(id));
+        let _ = app.update(Message::ShowTrash);
+        if let Screen::Main(st) = app.active_mut() {
+            assert!(st.accounts.is_empty());
+            assert_eq!(st.trash_items.len(), 1);
+        }
+        let _ = app.update(Message::RestoreItem(false, id));
+        if let Screen::Main(st) = app.active_mut() {
+            assert_eq!(st.accounts[0].group_id, second_group);
+            assert!(st.trash_items.is_empty());
+        }
+        let _ = app.update(Message::SelectGroup(second_group));
+        if let Screen::Main(st) = app.active_mut() {
+            assert!(!st.global_search);
+            assert!(!st.show_trash);
+            assert!(st.search.is_empty());
         }
     }
 }

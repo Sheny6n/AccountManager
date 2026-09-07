@@ -71,13 +71,32 @@ impl Db {
                 );",
             )
             .map_err(|e| e.to_string())?;
+        // Additive migration keeps existing profiles and their fields intact.
+        for table in ["groups", "accounts"] {
+            let mut stmt = self
+                .conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .map_err(|e| e.to_string())?;
+            let columns = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            if !columns.iter().any(|name| name == "deleted") {
+                self.conn
+                    .execute_batch(&format!(
+                        "ALTER TABLE {table} ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0;"
+                    ))
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         Ok(())
     }
 
     pub fn list_groups(&self) -> Result<Vec<Group>, String> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, name FROM groups ORDER BY name")
+            .prepare("SELECT id, name FROM groups WHERE deleted = 0 ORDER BY name")
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |r| {
@@ -140,25 +159,56 @@ impl Db {
     }
 
     pub fn delete_group(&self, id: i64) -> Result<(), String> {
+        // Children stay attached; restoring the group does not revive accounts
+        // that were separately trashed before the group was deleted.
         self.conn
-            .execute("DELETE FROM accounts WHERE group_id = ?1", params![id])
-            .map_err(|e| e.to_string())?;
-        self.conn
-            .execute("DELETE FROM groups WHERE id = ?1", params![id])
+            .execute("UPDATE groups SET deleted = 1 WHERE id = ?1", params![id])
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    pub fn list_accounts(&self, group_id: i64) -> Result<Vec<Account>, String> {
+    pub fn trash_items(&self) -> Result<Vec<(bool, i64, String)>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT 1, id, name FROM groups WHERE deleted = 1
+             UNION ALL
+             SELECT 0, a.id, a.site || ' · ' || g.name FROM accounts a
+             JOIN groups g ON g.id = a.group_id WHERE a.deleted = 1 AND g.deleted = 0
+             ORDER BY 1 DESC, 3",
+            )
+            .map_err(|e| e.to_string())?;
+        let items = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(|e| e.to_string())?;
+        items
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn restore(&self, group: bool, id: i64) -> Result<(), String> {
+        let sql = if group {
+            "UPDATE groups SET deleted = 0 WHERE id = ?1"
+        } else {
+            "UPDATE accounts SET deleted = 0 WHERE id = ?1"
+        };
+        self.conn
+            .execute(sql, params![id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn list_accounts(&self) -> Result<Vec<Account>, String> {
         let mut acc_stmt = self
             .conn
             .prepare(
-                "SELECT id, group_id, site, pinned FROM accounts
-                 WHERE group_id = ?1 ORDER BY pinned DESC, site",
+                "SELECT a.id, a.group_id, a.site, a.pinned FROM accounts a
+                 JOIN groups g ON g.id = a.group_id
+                 WHERE a.deleted = 0 AND g.deleted = 0 ORDER BY a.pinned DESC, a.site",
             )
             .map_err(|e| e.to_string())?;
         let mut accounts: Vec<Account> = acc_stmt
-            .query_map(params![group_id], |r| {
+            .query_map([], |r| {
                 let pinned: i64 = r.get(3)?;
                 Ok(Account {
                     id: r.get(0)?,
@@ -252,8 +302,105 @@ impl Db {
 
     pub fn delete_account(&self, id: i64) -> Result<(), String> {
         self.conn
-            .execute("DELETE FROM accounts WHERE id = ?1", params![id])
+            .execute("UPDATE accounts SET deleted = 1 WHERE id = ?1", params![id])
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn database() -> Db {
+        let db = Db::open(Path::new(":memory:"), None, None).unwrap();
+        db.init_schema().unwrap();
+        db
+    }
+
+    fn account(db: &Db, group_id: i64, site: &str) -> i64 {
+        db.upsert_account(&Account {
+            group_id,
+            site: site.into(),
+            pinned: true,
+            fields: vec![Field {
+                key: "email".into(),
+                value: "user@example.com".into(),
+            }],
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn global_listing_and_restore_preserve_fields_and_previous_deletions() {
+        let db = database();
+        let a = db.add_group("A").unwrap();
+        let b = db.add_group("B").unwrap();
+        let first = account(&db, a, "First");
+        let second = account(&db, a, "Second");
+        account(&db, b, "Third");
+        assert_eq!(db.list_accounts().unwrap().len(), 3);
+        db.delete_account(first).unwrap();
+        db.delete_group(a).unwrap();
+        assert_eq!(db.list_accounts().unwrap().len(), 1);
+        assert_eq!(db.list_groups().unwrap().len(), 1);
+        assert_eq!(db.trash_items().unwrap(), vec![(true, a, "A".into())]);
+        db.restore(true, a).unwrap();
+        let accounts = db.list_accounts().unwrap();
+        assert_eq!(accounts.len(), 2);
+        assert!(accounts.iter().any(|a| a.id == second));
+        assert!(!accounts.iter().any(|a| a.id == first));
+        assert_eq!(db.trash_items().unwrap()[0].1, first);
+        db.restore(false, first).unwrap();
+        let accounts = db.list_accounts().unwrap();
+        let restored = accounts.iter().find(|a| a.id == first).unwrap();
+        assert!(restored.pinned);
+        assert_eq!(restored.group_id, a);
+        assert_eq!(restored.fields[0].value, "user@example.com");
+        assert!(db.trash_items().unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_schema_migration_is_repeatable_and_preserves_data() {
+        let db = Db::open(Path::new(":memory:"), None, None).unwrap();
+        db.conn.execute_batch("CREATE TABLE groups(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+            CREATE TABLE accounts(id INTEGER PRIMARY KEY, group_id INTEGER NOT NULL REFERENCES groups(id), site TEXT NOT NULL, pinned INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO groups VALUES(1, 'Legacy');
+            INSERT INTO accounts VALUES(1, 1, 'Existing', 1);").unwrap();
+        db.init_schema().unwrap();
+        db.init_schema().unwrap();
+        assert_eq!(db.list_accounts().unwrap()[0].site, "Existing");
+        db.delete_group(1).unwrap();
+        db.init_schema().unwrap();
+        assert!(db.list_accounts().unwrap().is_empty());
+        db.restore(true, 1).unwrap();
+        assert_eq!(db.list_accounts().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn trash_survives_encrypted_profile_reopen() {
+        let path = std::env::temp_dir().join(format!("am-trash-test-{}.am", rand::random::<u64>()));
+        let key = [42u8; 32];
+        let id;
+        {
+            let db = Db::open(&path, Some(&key), None).unwrap();
+            db.init_schema().unwrap();
+            let group = db.add_group("Encrypted").unwrap();
+            id = account(&db, group, "Saved");
+            db.delete_account(id).unwrap();
+        }
+        {
+            let db = Db::open(&path, Some(&key), None).unwrap();
+            db.init_schema().unwrap();
+            assert!(db.list_accounts().unwrap().is_empty());
+            assert_eq!(db.trash_items().unwrap()[0].1, id);
+            db.restore(false, id).unwrap();
+            assert_eq!(
+                db.list_accounts().unwrap()[0].fields[0].value,
+                "user@example.com"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }
